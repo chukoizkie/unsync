@@ -1,0 +1,17 @@
+{
+  "project_info": {
+    "project_id": "YOUR_FIREBASE_PROJECT_ID"
+  },
+  "client": [
+    {
+      "client_info": {
+        "android_info": {
+          "package_name": "com.example.unsync"
+        }
+      },
+      "services": {
+        "appinvite_service": {}
+      }
+    }
+  ]
+}

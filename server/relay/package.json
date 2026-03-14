@@ -1,0 +1,9 @@
+{
+  "name": "unsync-relay",
+  "version": "1.0.0",
+  "description": "Unsync relay server for offline message delivery",
+  "main": "relay.js",
+  "dependencies": {
+    "ws": "^8.0.0"
+  }
+}

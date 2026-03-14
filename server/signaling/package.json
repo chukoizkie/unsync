@@ -1,0 +1,10 @@
+{
+  "name": "unsync-signaling",
+  "version": "1.0.0",
+  "description": "Unsync WebRTC signaling server",
+  "main": "server.js",
+  "dependencies": {
+    "firebase-admin": "^11.0.0",
+    "ws": "^8.0.0"
+  }
+}
