@@ -4,7 +4,7 @@ import 'call_notification_service.dart';
 @pragma('vm:entry-point')
 Future<void> firebaseMessagingBackgroundHandler(RemoteMessage message) async {
   final callerId = message.data['callerId'] as String?;
-  final callerName = message.data['callerName'] as String? ?? callerId ?? 'Unknown';
+  final callerName = message.data['callerName'] as String? ?? 'Unknown'; // resolved to display name in app
   final type = message.data['type'] as String?;
   if (type == 'call_offer' && callerId != null) {
     await CallNotificationService.initialize();

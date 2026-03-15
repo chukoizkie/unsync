@@ -12,8 +12,9 @@ class CallNotificationService {
     await _plugin.initialize(
       const InitializationSettings(android: android),
       onDidReceiveNotificationResponse: (details) {
-        if (details.payload != null) {
-          onNotificationTapped?.call(details.payload!);
+        final payload = details.payload;
+        if (payload != null && payload.startsWith('call:')) {
+          onNotificationTapped?.call(payload.replaceFirst('call:', ''));
         }
       },
     );
@@ -49,11 +50,19 @@ class CallNotificationService {
       'Incoming call',
       callerName,
       const NotificationDetails(android: details),
-      payload: callerId,
+      payload: 'call:$callerId',
     );
   }
 
   static Future<void> cancel() async {
     await _plugin.cancel(_notifId);
+  }
+
+  static Future<String?> getInitialCallerId() async {
+    final details = await _plugin.getNotificationAppLaunchDetails();
+    if (details?.didNotificationLaunchApp == true) {
+      return details?.notificationResponse?.payload;
+    }
+    return null;
   }
 }

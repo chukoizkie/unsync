@@ -5,6 +5,7 @@ import 'services/identity_service.dart';
 import 'screens/setup_screen.dart';
 import 'services/signaling_service.dart';
 import 'services/call_notification_service.dart';
+import 'services/message_notification_service.dart';
 import 'services/relay_service.dart';
 import 'services/contacts_service.dart';
 import 'services/signal_service.dart';
@@ -180,6 +181,68 @@ class _ContactsScreenState extends State<ContactsScreen> {
       });
       final id = _identity.peerId ?? DateTime.now().millisecondsSinceEpoch.toString();
       await CallNotificationService.initialize();
+      await MessageNotificationService.initialize();
+      // Handle case where app was launched by tapping notification (killed state)
+      final initialCallerId = await CallNotificationService.getInitialCallerId();
+      if (initialCallerId != null) {
+        // Wait for signaling to connect before showing call screen
+        for (int i = 0; i < 20; i++) {
+          await Future.delayed(const Duration(milliseconds: 500));
+          if (_signaling.myId != null) break;
+        }
+        if (mounted) {
+          CallNotificationService.onNotificationTapped?.call(initialCallerId);
+        }
+      }
+      CallNotificationService.onNotificationTapped = (callerId) {
+        final saved = _realContacts.firstWhere(
+          (c) => c.peerId == callerId,
+          orElse: () => SavedContact(peerId: callerId, displayName: callerId, addedAt: DateTime.now()),
+        );
+        if (!mounted) return;
+        Navigator.push(
+          context,
+          MaterialPageRoute(
+            builder: (_) => IncomingCallScreen(
+              callerName: saved.displayName,
+              onDecline: () {
+                _signaling.declineCall();
+                try { CallNotificationService.cancel(); } catch (_) {}
+                Navigator.pop(context);
+              },
+              onAccept: () async {
+                try { CallNotificationService.cancel(); } catch (_) {}
+                await _signaling.acceptCall();
+                if (context.mounted) {
+                  Navigator.pushReplacement(
+                    context,
+                    MaterialPageRoute(
+                      builder: (_) => StatefulBuilder(
+                        builder: (ctx, setS) {
+                          bool isMuted = false;
+                          return CallScreen(
+                            contactName: saved.displayName,
+                            isOutgoing: false,
+                            isMuted: isMuted,
+                            onMuteTap: () {
+                              setS(() => isMuted = !isMuted);
+                              _signaling.setMicMuted(isMuted);
+                            },
+                            onHangUp: () {
+                              _signaling.endVoiceCall();
+                              Navigator.pop(ctx);
+                            },
+                          );
+                        },
+                      ),
+                    ),
+                  );
+                }
+              },
+            ),
+          ),
+        );
+      };
       final fcmToken = await FCMService.initialize();
       await _relayService.connect(id);
       // Upload our pre-key bundle to relay for async messaging
@@ -219,6 +282,12 @@ class _ContactsScreenState extends State<ContactsScreen> {
         }
         _messagesService.addMessage(from, text, false);
         _newMessageNotifier.value = '$from:${DateTime.now().millisecondsSinceEpoch}';
+        MessageNotificationService.playMessageSound();
+        final senderName1 = _realContacts.firstWhere(
+          (c) => c.peerId == from,
+          orElse: () => SavedContact(peerId: from, displayName: from, addedAt: DateTime.now()),
+        ).displayName;
+        MessageNotificationService.showMessageNotification(senderName1, text);
         print('Relay: queued message delivered from $from');
       };
       print('Connecting to signaling with id: ${id}');
@@ -286,8 +355,8 @@ class _ContactsScreenState extends State<ContactsScreen> {
 
       _signaling.onCallEnded = () {
         try { CallNotificationService.cancel(); } catch (_) {}
-        if (mounted && Navigator.canPop(context)) {
-          Navigator.pop(context);
+        if (mounted) {
+          Navigator.of(context).popUntil((route) => route.isFirst);
         }
       };
       _signaling.onMessageReceived = (peerId, msg) async {
@@ -340,6 +409,12 @@ class _ContactsScreenState extends State<ContactsScreen> {
           if (mounted) setState(() {
             _messages[peerId] = msgs;
             _newMessageNotifier.value = '$peerId:${DateTime.now().millisecondsSinceEpoch}';
+            MessageNotificationService.playMessageSound();
+            final senderName2 = _realContacts.firstWhere(
+              (c) => c.peerId == peerId,
+              orElse: () => SavedContact(peerId: peerId, displayName: peerId, addedAt: DateTime.now()),
+            ).displayName;
+            MessageNotificationService.showMessageNotification(senderName2, plaintext);
           });
         });
       };
