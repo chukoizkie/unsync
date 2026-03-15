@@ -1,8 +1,15 @@
 import 'package:firebase_messaging/firebase_messaging.dart';
+import 'call_notification_service.dart';
 
 @pragma('vm:entry-point')
 Future<void> firebaseMessagingBackgroundHandler(RemoteMessage message) async {
-  print('FCM background ping from: ${message.data['from']}');
+  final callerId = message.data['callerId'] as String?;
+  final callerName = message.data['callerName'] as String? ?? callerId ?? 'Unknown';
+  final type = message.data['type'] as String?;
+  if (type == 'call_offer' && callerId != null) {
+    await CallNotificationService.initialize();
+    await CallNotificationService.showIncomingCall(callerName, callerId);
+  }
 }
 
 class FCMService {
@@ -10,16 +17,14 @@ class FCMService {
 
   static Future<String?> initialize() async {
     FirebaseMessaging.onBackgroundMessage(firebaseMessagingBackgroundHandler);
-    await _fcm.requestPermission(
-      alert: false,
-      badge: false,
-      sound: false,
-    );
+    await _fcm.requestPermission(alert: true, badge: false, sound: false);
     FirebaseMessaging.onMessage.listen((message) {
-      print('FCM ping received (foreground) from: ${message.data['from']}');
+      final from = message.data['from'];
+      print('FCM ping received (foreground) from: $from');
     });
     FirebaseMessaging.onMessageOpenedApp.listen((message) {
-      print('FCM ping — app reopened from: ${message.data['from']}');
+      final from = message.data['from'];
+      print('FCM ping - app reopened from: $from');
     });
     final token = await _fcm.getToken();
     print('FCM Token: $token');

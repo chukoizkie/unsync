@@ -4,6 +4,7 @@ import 'package:flutter/services.dart';
 import 'services/identity_service.dart';
 import 'screens/setup_screen.dart';
 import 'services/signaling_service.dart';
+import 'services/call_notification_service.dart';
 import 'services/relay_service.dart';
 import 'services/contacts_service.dart';
 import 'services/signal_service.dart';
@@ -13,6 +14,7 @@ import 'services/fcm_service.dart';
 import 'package:firebase_messaging/firebase_messaging.dart';
 import 'screens/qr_screen.dart';
 import 'screens/call_screen.dart';
+import 'screens/incoming_call_screen.dart';
 import 'screens/biometric_screen.dart';
 import 'services/biometric_service.dart';
 import 'package:firebase_core/firebase_core.dart';
@@ -177,6 +179,7 @@ class _ContactsScreenState extends State<ContactsScreen> {
         _realContacts = _contactsService.contacts.toList();
       });
       final id = _identity.peerId ?? DateTime.now().millisecondsSinceEpoch.toString();
+      await CallNotificationService.initialize();
       final fcmToken = await FCMService.initialize();
       await _relayService.connect(id);
       // Upload our pre-key bundle to relay for async messaging
@@ -230,31 +233,51 @@ class _ContactsScreenState extends State<ContactsScreen> {
         if (mounted) setState(() => _connected = false);
       };
 
-      _signaling.onIncomingCall = (peerId) {
+      _signaling.onIncomingCall = (peerId) async {
         final saved = _realContacts.firstWhere(
           (c) => c.peerId == peerId,
           orElse: () => SavedContact(peerId: peerId, displayName: peerId, addedAt: DateTime.now()),
         );
+        await CallNotificationService.showIncomingCall(saved.displayName, peerId);
         if (!mounted) return;
         Navigator.push(
           context,
           MaterialPageRoute(
-            builder: (_) => StatefulBuilder(
-              builder: (ctx, setS) {
-                bool isMuted = false;
-                return CallScreen(
-                  contactName: saved.displayName,
-                  isOutgoing: false,
-                  isMuted: isMuted,
-                  onMuteTap: () {
-                    setS(() => isMuted = !isMuted);
-                    _signaling.setMicMuted(isMuted);
-                  },
-                  onHangUp: () {
-                    _signaling.endVoiceCall();
-                    Navigator.pop(ctx);
-                  },
-                );
+            builder: (_) => IncomingCallScreen(
+              callerName: saved.displayName,
+              onDecline: () {
+                _signaling.declineCall();
+                try { CallNotificationService.cancel(); } catch (_) {}
+                Navigator.pop(context);
+              },
+              onAccept: () async {
+                try { CallNotificationService.cancel(); } catch (_) {}
+                await _signaling.acceptCall();
+                if (context.mounted) {
+                  Navigator.pushReplacement(
+                    context,
+                    MaterialPageRoute(
+                      builder: (_) => StatefulBuilder(
+                        builder: (ctx, setS) {
+                          bool isMuted = false;
+                          return CallScreen(
+                            contactName: saved.displayName,
+                            isOutgoing: false,
+                            isMuted: isMuted,
+                            onMuteTap: () {
+                              setS(() => isMuted = !isMuted);
+                              _signaling.setMicMuted(isMuted);
+                            },
+                            onHangUp: () {
+                              _signaling.endVoiceCall();
+                              Navigator.pop(ctx);
+                            },
+                          );
+                        },
+                      ),
+                    ),
+                  );
+                }
               },
             ),
           ),
@@ -262,6 +285,7 @@ class _ContactsScreenState extends State<ContactsScreen> {
       };
 
       _signaling.onCallEnded = () {
+        try { CallNotificationService.cancel(); } catch (_) {}
         if (mounted && Navigator.canPop(context)) {
           Navigator.pop(context);
         }
@@ -497,9 +521,9 @@ class _ContactsScreenState extends State<ContactsScreen> {
             padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
             child: Row(
               children: [
-                _buildTab('Messages', 0),
+                Expanded(child: _buildTab('Messages', 0)),
                 const SizedBox(width: 8),
-                _buildTab('Calls', 1),
+                Expanded(child: _buildTab('Calls', 1)),
               ],
             ),
           ),
@@ -515,14 +539,31 @@ class _ContactsScreenState extends State<ContactsScreen> {
                       id: _realContacts[index].peerId,
                       name: _realContacts[index].displayName,
                       initials: _realContacts[index].displayName.substring(0, 1).toUpperCase(),
-                      lastMessage: 'Tap to chat',
+                      lastMessage: _selectedTab == 0 ? 'Tap to chat' : 'Tap to call',
                       time: '',
                       online: true,
                     );
                 return _ContactTile(
                   contact: contact,
                   onLongPress: () => _showContactOptions(context, contact),
-                  onTap: () => Navigator.push(
+                  onTap: () {
+                    if (_selectedTab == 1) {
+                      _signaling.startVoiceCall(contact.id, callerName: contact.name);
+                      bool _isMuted = false;
+                      Navigator.push(context, MaterialPageRoute(
+                        builder: (_) => StatefulBuilder(
+                          builder: (ctx, setS) => CallScreen(
+                            contactName: contact.name,
+                            isOutgoing: true,
+                            isMuted: _isMuted,
+                            onMuteTap: () { setS(() => _isMuted = !_isMuted); _signaling.setMicMuted(_isMuted); },
+                            onHangUp: () { _signaling.endVoiceCall(); Navigator.pop(ctx); },
+                          ),
+                        ),
+                      ));
+                      return;
+                    }
+                    Navigator.push(
                     context,
                     MaterialPageRoute(
                       builder: (_) => ChatScreen(
@@ -553,7 +594,8 @@ class _ContactsScreenState extends State<ContactsScreen> {
                         },
                       ),
                     ),
-                  ),
+                  );
+                  },
                 );
               },
             ),
@@ -578,8 +620,27 @@ class _ContactsScreenState extends State<ContactsScreen> {
           color: kBg,
         ),
         child: BottomNavigationBar(
-          currentIndex: _selectedTab,
-          onTap: (i) => setState(() => _selectedTab = i),
+          currentIndex: 0,
+          onTap: (i) {
+            final labels = ['Mail', 'Notes', 'Planner', 'Social'];
+            showDialog(
+              context: context,
+              builder: (_) => AlertDialog(
+                backgroundColor: const Color(0xFF111111),
+                shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(4)),
+                title: Text('Unsync ${labels[i]}',
+                  style: const TextStyle(color: Color(0xFFF0F0F0), fontWeight: FontWeight.w700)),
+                content: Text('Your secure ${labels[i].toLowerCase()} service is coming soon.',
+                  style: const TextStyle(color: Color(0xFF555555))),
+                actions: [
+                  TextButton(
+                    onPressed: () => Navigator.pop(context),
+                    child: const Text('Got it', style: TextStyle(color: Color(0xFF00FF87))),
+                  ),
+                ],
+              ),
+            );
+          },
           backgroundColor: kBg,
           selectedItemColor: kAccent,
           unselectedItemColor: kMuted,
@@ -588,10 +649,12 @@ class _ContactsScreenState extends State<ContactsScreen> {
           selectedLabelStyle: const TextStyle(fontSize: 11, fontWeight: FontWeight.w600),
           unselectedLabelStyle: const TextStyle(fontSize: 11),
           elevation: 0,
+          type: BottomNavigationBarType.fixed,
           items: const [
-            BottomNavigationBarItem(icon: Icon(Icons.chat_bubble_outline), activeIcon: Icon(Icons.chat_bubble), label: 'Chats'),
-            BottomNavigationBarItem(icon: Icon(Icons.call_outlined), activeIcon: Icon(Icons.call), label: 'Calls'),
-            BottomNavigationBarItem(icon: Icon(Icons.person_outline), activeIcon: Icon(Icons.person), label: 'Profile'),
+            BottomNavigationBarItem(icon: Icon(Icons.email_outlined), activeIcon: Icon(Icons.email), label: 'Mail'),
+            BottomNavigationBarItem(icon: Icon(Icons.note_outlined), activeIcon: Icon(Icons.note), label: 'Notes'),
+            BottomNavigationBarItem(icon: Icon(Icons.calendar_today_outlined), activeIcon: Icon(Icons.calendar_today), label: 'Planner'),
+            BottomNavigationBarItem(icon: Icon(Icons.people_outline), activeIcon: Icon(Icons.people), label: 'Social'),
           ],
         ),
       ),
@@ -603,6 +666,7 @@ class _ContactsScreenState extends State<ContactsScreen> {
     return GestureDetector(
       onTap: () => setState(() => _selectedTab = index),
       child: Container(
+        width: double.infinity,
         padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 6),
         decoration: BoxDecoration(
           color: selected ? kAccentDim : Colors.transparent,
@@ -610,6 +674,7 @@ class _ContactsScreenState extends State<ContactsScreen> {
         ),
         child: Text(
           label,
+          textAlign: TextAlign.center,
           style: TextStyle(
             color: selected ? kAccent : kMuted,
             fontSize: 12,
@@ -1046,7 +1111,7 @@ class _ChatScreenState extends State<ChatScreen> {
           IconButton(
             icon: const Icon(Icons.call_outlined, color: kMuted),
             onPressed: () async {
-              await widget.signaling?.startVoiceCall(widget.contact.id);
+              await widget.signaling?.startVoiceCall(widget.contact.id, callerName: widget.contact.name);
               if (context.mounted) {
                 bool _isMuted = false;
                 Navigator.push(

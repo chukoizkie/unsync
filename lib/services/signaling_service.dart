@@ -32,6 +32,7 @@ class SignalingService {
 
   // Active voice call peer
   String? _callPeerId;
+  RTCSessionDescription? _pendingCallOffer;
 
   Timer? _pingTimer;
 
@@ -118,13 +119,14 @@ class SignalingService {
       case 'call_offer':
         final fromId = msg['from'] as String;
         _callPeerId = fromId;
-        final webrtc = await _getOrCreatePeer(fromId, isInitiator: false);
-        final answer = await webrtc.createAnswer(
-          RTCSessionDescription(msg['sdp']['sdp'], msg['sdp']['type']),
-          withAudio: true,
-        );
-        _send({'type': 'call_answer', 'to': fromId, 'sdp': answer.toMap()});
+        _pendingCallOffer = RTCSessionDescription(msg['sdp']['sdp'], msg['sdp']['type']);
         onIncomingCall?.call(fromId);
+        break;
+
+      case 'call_declined':
+        _callPeerId = null;
+        _pendingCallOffer = null;
+        onCallEnded?.call();
         break;
 
       case 'call_answer':
@@ -215,19 +217,34 @@ class SignalingService {
     _resetIdleTimer(peerId);
   }
 
-  Future<void> startVoiceCall(String peerId) async {
+  Future<void> startVoiceCall(String peerId, {String? callerName}) async {
     _callPeerId = peerId;
     _idleTimers[peerId]?.cancel();
     final webrtc = await _getOrCreatePeer(peerId);
     await webrtc.addAudioTrack();
     final offer = await webrtc.createOffer(withAudio: true);
-    _send({'type': 'call_offer', 'to': peerId, 'sdp': offer.toMap()});
+    _send({'type': 'call_offer', 'to': peerId, 'sdp': offer.toMap(), 'callerName': callerName ?? _myId ?? ''});
   }
 
   void setMicMuted(bool muted) {
     if (_callPeerId != null) {
       _peers[_callPeerId]?.setMicMuted(muted);
     }
+  }
+
+  Future<void> acceptCall() async {
+    if (_callPeerId == null || _pendingCallOffer == null) return;
+    final webrtc = await _getOrCreatePeer(_callPeerId!, isInitiator: false);
+    final answer = await webrtc.createAnswer(_pendingCallOffer!, withAudio: true);
+    _send({'type': 'call_answer', 'to': _callPeerId, 'sdp': answer.toMap()});
+    _pendingCallOffer = null;
+  }
+
+  void declineCall() {
+    if (_callPeerId == null) return;
+    _send({'type': 'call_declined', 'to': _callPeerId});
+    _callPeerId = null;
+    _pendingCallOffer = null;
   }
 
   void endVoiceCall() {
