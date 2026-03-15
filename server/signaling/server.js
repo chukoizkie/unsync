@@ -11,7 +11,7 @@ async function sendFCMPing(token, fromId, extraData = {}) {
   try {
     await admin.messaging().send({
       token: token,
-      data: { type: 'ping', from: fromId, ...extraData },
+      data: { type: 'ping', callerId: fromId, ...extraData },
       android: { priority: 'high' }
     });
     console.log('FCM ping sent to ' + token.substring(0, 20));
@@ -61,8 +61,7 @@ wss.on('connection', (ws) => {
               const callerName = msg.callerName || myId;
               await sendFCMPing(token, myId, {
                 type: 'call_offer',
-                callerName: callerName,
-                sdp: JSON.stringify(msg.sdp)
+                callerName: callerName
               });
               console.log(`call_offer FCM wake sent to ${msg.to}`);
             } else {
@@ -102,7 +101,7 @@ wss.on('connection', (ws) => {
   ws.on('close', () => {
     if (myId) {
       peers.delete(myId);
-    fcmTokens.delete(myId);
+    // Keep fcmToken across disconnects so we can FCM-wake killed app
       console.log(`Peer disconnected: ${myId}`);
     }
   });
