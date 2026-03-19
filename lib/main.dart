@@ -1,3 +1,4 @@
+import "package:shared_preferences/shared_preferences.dart";
 import 'dart:convert';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
@@ -410,6 +411,35 @@ class _ContactsScreenState extends State<ContactsScreen> {
           }
           if (mounted) {
             CallNotificationService.onNotificationTapped?.call(initialCallerId);
+          }
+        }
+        // Handle message notification tap from killed state
+        Future.microtask(() async {
+          final initialPeerId = await MessageNotificationService.getInitialPeerId();
+          if (initialPeerId != null) {
+            for (int i = 0; i < 30; i++) {
+              await Future.delayed(const Duration(milliseconds: 500));
+              if (_signaling.myId != null && _realContacts.isNotEmpty) break;
+            }
+            if (mounted) {
+              MessageNotificationService.onNotificationTapped?.call(initialPeerId);
+            }
+          }
+        });
+      });
+      // Handle FCM message wake from killed state
+      Future.microtask(() async {
+        final prefs = await SharedPreferences.getInstance();
+        final pendingFromId = prefs.getString('pending_message_wake');
+        if (pendingFromId != null && pendingFromId.isNotEmpty) {
+          await prefs.remove('pending_message_wake');
+          await MessageNotificationService.cancel();
+          for (int i = 0; i < 30; i++) {
+            await Future.delayed(const Duration(milliseconds: 500));
+            if (_signaling.myId != null && _realContacts.isNotEmpty) break;
+          }
+          if (mounted) {
+            MessageNotificationService.onNotificationTapped?.call(pendingFromId);
           }
         }
       });

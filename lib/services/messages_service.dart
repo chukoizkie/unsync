@@ -45,6 +45,7 @@ class MessagesService {
   }
 
   Future<void> addMessage(String peerId, String text, bool isSent) async {
+    if (!_cache.containsKey(peerId)) await getMessages(peerId);
     _cache.putIfAbsent(peerId, () => []);
     _cache[peerId]!.add(StoredMessage(
       text: text,

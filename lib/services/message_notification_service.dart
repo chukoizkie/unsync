@@ -54,4 +54,19 @@ class MessageNotificationService {
       payload: 'msg:${peerId ?? senderName}',
     );
   }
+
+  static Future<void> cancel() async {
+    await _plugin.cancelAll();
+  }
+
+  static Future<String?> getInitialPeerId() async {
+    final details = await _plugin.getNotificationAppLaunchDetails();
+    if (details?.didNotificationLaunchApp == true) {
+      final payload = details?.notificationResponse?.payload;
+      if (payload != null && payload.startsWith('msg:')) {
+        return payload.replaceFirst('msg:', '');
+      }
+    }
+    return null;
+  }
 }
