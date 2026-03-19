@@ -52,3 +52,5 @@ ios/Runner/GoogleService-Info.plist
 *.jks
 key.properties
 server/signaling/serviceAccount.json
+android/key.properties
+*.jks

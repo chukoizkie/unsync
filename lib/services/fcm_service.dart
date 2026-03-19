@@ -1,10 +1,14 @@
 import 'package:firebase_messaging/firebase_messaging.dart';
+import 'package:firebase_core/firebase_core.dart';
+import 'package:flutter/widgets.dart';
 import 'call_notification_service.dart';
 
 @pragma('vm:entry-point')
 Future<void> firebaseMessagingBackgroundHandler(RemoteMessage message) async {
+  WidgetsFlutterBinding.ensureInitialized();
+  await Firebase.initializeApp();
   final callerId = message.data['callerId'] as String?;
-  final callerName = message.data['callerName'] as String? ?? 'Unknown'; // resolved to display name in app
+  final callerName = message.data['callerName'] as String? ?? callerId ?? 'Unknown';
   final type = message.data['type'] as String?;
   if (type == 'call_offer' && callerId != null) {
     await CallNotificationService.initialize();
@@ -14,7 +18,6 @@ Future<void> firebaseMessagingBackgroundHandler(RemoteMessage message) async {
 
 class FCMService {
   static final _fcm = FirebaseMessaging.instance;
-
   static Future<String?> initialize() async {
     FirebaseMessaging.onBackgroundMessage(firebaseMessagingBackgroundHandler);
     await _fcm.requestPermission(alert: true, badge: false, sound: false);
@@ -30,6 +33,5 @@ class FCMService {
     print('FCM Token: $token');
     return token;
   }
-
   static Future<String?> getToken() => _fcm.getToken();
 }

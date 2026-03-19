@@ -2,10 +2,11 @@ import 'package:flutter_local_notifications/flutter_local_notifications.dart';
 
 class CallNotificationService {
   static final _plugin = FlutterLocalNotificationsPlugin();
-  static const _channelId = 'unsync_incoming_call';
+  static const _channelId = 'unsync_incoming_call_v3';
   static const _notifId = 42;
 
   static Function(String callerId)? onNotificationTapped;
+  static String? lastCallerName;
 
   static Future<void> initialize() async {
     const android = AndroidInitializationSettings('@mipmap/ic_launcher');
@@ -14,7 +15,10 @@ class CallNotificationService {
       onDidReceiveNotificationResponse: (details) {
         final payload = details.payload;
         if (payload != null && payload.startsWith('call:')) {
-          onNotificationTapped?.call(payload.replaceFirst('call:', ''));
+          final parts = payload.replaceFirst('call:', '').split(':');
+          final callerId = parts[0];
+          lastCallerName = parts.length > 1 ? parts[1] : callerId;
+          onNotificationTapped?.call(callerId);
         }
       },
     );
@@ -23,7 +27,7 @@ class CallNotificationService {
       'Incoming Calls',
       description: 'Incoming Unsync voice calls',
       importance: Importance.max,
-      playSound: false,
+      playSound: true,
       enableVibration: true,
     );
     final androidImpl = _plugin
@@ -32,6 +36,7 @@ class CallNotificationService {
   }
 
   static Future<void> showIncomingCall(String callerName, String callerId) async {
+    lastCallerName = callerName;
     const details = AndroidNotificationDetails(
       _channelId,
       'Incoming Calls',
@@ -42,7 +47,7 @@ class CallNotificationService {
       category: AndroidNotificationCategory.call,
       autoCancel: false,
       ongoing: true,
-      playSound: false,
+      playSound: true,
       visibility: NotificationVisibility.public,
     );
     await _plugin.show(
@@ -61,7 +66,12 @@ class CallNotificationService {
   static Future<String?> getInitialCallerId() async {
     final details = await _plugin.getNotificationAppLaunchDetails();
     if (details?.didNotificationLaunchApp == true) {
-      return details?.notificationResponse?.payload;
+      final payload = details?.notificationResponse?.payload;
+      if (payload != null && payload.startsWith('call:')) {
+        final parts = payload.replaceFirst('call:', '').split(':');
+        lastCallerName = parts.length > 1 ? parts[1] : parts[0];
+        return parts[0]; // return callerId only
+      }
     }
     return null;
   }

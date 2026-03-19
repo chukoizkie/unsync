@@ -182,22 +182,63 @@ class _ContactsScreenState extends State<ContactsScreen> {
       final id = _identity.peerId ?? DateTime.now().millisecondsSinceEpoch.toString();
       await CallNotificationService.initialize();
       await MessageNotificationService.initialize();
-      // Handle case where app was launched by tapping notification (killed state)
-      final initialCallerId = await CallNotificationService.getInitialCallerId();
-      if (initialCallerId != null) {
-        // Wait for signaling to connect before showing call screen
-        for (int i = 0; i < 20; i++) {
-          await Future.delayed(const Duration(milliseconds: 500));
-          if (_signaling.myId != null) break;
-        }
-        if (mounted) {
-          CallNotificationService.onNotificationTapped?.call(initialCallerId);
-        }
-      }
+      MessageNotificationService.onNotificationTapped = (peerId) async {
+        // Wait briefly for relay to deliver pending messages
+        await Future.delayed(const Duration(seconds: 2));
+        await _contactsService.initialize();
+        _realContacts = _contactsService.contacts.toList();
+        final saved = _realContacts.firstWhere(
+          (c) => c.peerId == peerId,
+          orElse: () => SavedContact(peerId: peerId, displayName: peerId, addedAt: DateTime.now()),
+        );
+        if (!mounted) return;
+        final loadedMsgs = await _messagesService.getMessages(peerId);
+        final contact = Contact(
+          id: saved.peerId,
+          name: saved.displayName,
+          initials: saved.displayName.substring(0, 1).toUpperCase(),
+          lastMessage: '',
+          time: '',
+          online: true,
+        );
+        Navigator.push(
+          context,
+          MaterialPageRoute(
+            builder: (_) => ChatScreen(
+              contact: contact,
+              signaling: _signaling,
+              relayService: _relayService,
+              connectionNotifier: _connectionNotifier,
+              myId: _identity.peerId,
+              myName: _identity.displayName,
+              onProcessBundle: (peerId, bundle) async {
+                await _signalService.processPreKeyBundleFromMap(peerId, bundle);
+              },
+              initialMessages: loadedMsgs,
+              messagesService: _messagesService,
+              newMessageNotifier: _newMessageNotifier,
+              onMessageSaved: (text, isSent) {
+                _messagesService.addMessage(contact.id, text, isSent);
+              },
+              onEncrypt: (text) async {
+                if (_signalService.isInitialized) {
+                  try {
+                    return await _signalService.encrypt(contact.id, text);
+                  } catch (e) {
+                    print('Encrypt error: \$e');
+                  }
+                }
+                return text;
+              },
+            ),
+          ),
+        );
+      };
       CallNotificationService.onNotificationTapped = (callerId) {
+        final fallbackName = CallNotificationService.lastCallerName ?? callerId;
         final saved = _realContacts.firstWhere(
           (c) => c.peerId == callerId,
-          orElse: () => SavedContact(peerId: callerId, displayName: callerId, addedAt: DateTime.now()),
+          orElse: () => SavedContact(peerId: callerId, displayName: fallbackName, addedAt: DateTime.now()),
         );
         if (!mounted) return;
         Navigator.push(
@@ -230,7 +271,6 @@ class _ContactsScreenState extends State<ContactsScreen> {
                             },
                             onHangUp: () {
                               _signaling.endVoiceCall();
-                              Navigator.pop(ctx);
                             },
                           );
                         },
@@ -287,7 +327,7 @@ class _ContactsScreenState extends State<ContactsScreen> {
           (c) => c.peerId == from,
           orElse: () => SavedContact(peerId: from, displayName: from, addedAt: DateTime.now()),
         ).displayName;
-        MessageNotificationService.showMessageNotification(senderName1, text);
+        MessageNotificationService.showMessageNotification(senderName1, text, peerId: from);
         print('Relay: queued message delivered from $from');
       };
       print('Connecting to signaling with id: ${id}');
@@ -339,7 +379,6 @@ class _ContactsScreenState extends State<ContactsScreen> {
                             },
                             onHangUp: () {
                               _signaling.endVoiceCall();
-                              Navigator.pop(ctx);
                             },
                           );
                         },
@@ -359,6 +398,21 @@ class _ContactsScreenState extends State<ContactsScreen> {
           Navigator.of(context).popUntil((route) => route.isFirst);
         }
       };
+
+      // Handle notification tap that launched app from killed state
+      Future.microtask(() async {
+        final initialCallerId = await CallNotificationService.getInitialCallerId();
+        if (initialCallerId != null) {
+          // Wait for both signaling AND contacts to load
+          for (int i = 0; i < 30; i++) {
+            await Future.delayed(const Duration(milliseconds: 500));
+            if (_signaling.myId != null && _realContacts.isNotEmpty) break;
+          }
+          if (mounted) {
+            CallNotificationService.onNotificationTapped?.call(initialCallerId);
+          }
+        }
+      });
       _signaling.onMessageReceived = (peerId, msg) async {
         print('Message received from peerId: $peerId msg: $msg');
         // Check if handshake
@@ -414,7 +468,7 @@ class _ContactsScreenState extends State<ContactsScreen> {
               (c) => c.peerId == peerId,
               orElse: () => SavedContact(peerId: peerId, displayName: peerId, addedAt: DateTime.now()),
             ).displayName;
-            MessageNotificationService.showMessageNotification(senderName2, plaintext);
+            MessageNotificationService.showMessageNotification(senderName2, plaintext, peerId: peerId);
           });
         });
       };
@@ -623,7 +677,7 @@ class _ContactsScreenState extends State<ContactsScreen> {
                   onLongPress: () => _showContactOptions(context, contact),
                   onTap: () {
                     if (_selectedTab == 1) {
-                      _signaling.startVoiceCall(contact.id, callerName: contact.name);
+                      _signaling.startVoiceCall(contact.id, callerName: _identity.displayName ?? "");
                       bool _isMuted = false;
                       Navigator.push(context, MaterialPageRoute(
                         builder: (_) => StatefulBuilder(
@@ -632,7 +686,7 @@ class _ContactsScreenState extends State<ContactsScreen> {
                             isOutgoing: true,
                             isMuted: _isMuted,
                             onMuteTap: () { setS(() => _isMuted = !_isMuted); _signaling.setMicMuted(_isMuted); },
-                            onHangUp: () { _signaling.endVoiceCall(); Navigator.pop(ctx); },
+                            onHangUp: () { _signaling.endVoiceCall(); },
                           ),
                         ),
                       ));
@@ -647,6 +701,7 @@ class _ContactsScreenState extends State<ContactsScreen> {
                         relayService: _relayService,
                         connectionNotifier: _connectionNotifier,
                         myId: _identity.peerId,
+              myName: _identity.displayName,
                         onProcessBundle: (peerId, bundle) async {
                           await _signalService.processPreKeyBundleFromMap(peerId, bundle);
                         },
@@ -1027,13 +1082,14 @@ class ChatScreen extends StatefulWidget {
   final RelayService? relayService;
   final ValueNotifier<bool> connectionNotifier;
   final String? myId;
+  final String? myName;
   final Future<void> Function(String peerId, Map<String, dynamic> bundle)? onProcessBundle;
   final List<StoredMessage> initialMessages;
   final Function(String text, bool isSent)? onMessageSaved;
   final MessagesService? messagesService;
   final ValueNotifier<String>? newMessageNotifier;
   final Future<String> Function(String)? onEncrypt;
-  const ChatScreen({super.key, required this.contact, this.signaling, this.relayService, required this.connectionNotifier, this.myId, this.onProcessBundle, this.initialMessages = const [], this.onMessageSaved, this.messagesService, this.newMessageNotifier, this.onEncrypt});
+  const ChatScreen({super.key, required this.contact, this.signaling, this.relayService, required this.connectionNotifier, this.myId, this.myName, this.onProcessBundle, this.initialMessages = const [], this.onMessageSaved, this.messagesService, this.newMessageNotifier, this.onEncrypt});
 
   @override
   State<ChatScreen> createState() => _ChatScreenState();
@@ -1186,7 +1242,7 @@ class _ChatScreenState extends State<ChatScreen> {
           IconButton(
             icon: const Icon(Icons.call_outlined, color: kMuted),
             onPressed: () async {
-              await widget.signaling?.startVoiceCall(widget.contact.id, callerName: widget.contact.name);
+              await widget.signaling?.startVoiceCall(widget.contact.id, callerName: widget.myName ?? "");
               if (context.mounted) {
                 bool _isMuted = false;
                 Navigator.push(

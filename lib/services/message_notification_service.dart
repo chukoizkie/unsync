@@ -5,9 +5,19 @@ class MessageNotificationService {
   static final _player = AudioPlayer();
   static final _plugin = FlutterLocalNotificationsPlugin();
   static const _channelId = 'unsync_messages';
+  static Function(String peerId)? onNotificationTapped;
 
   static Future<void> initialize() async {
-    // Create notification channel
+    const android = AndroidInitializationSettings('@mipmap/ic_launcher');
+    await _plugin.initialize(
+      const InitializationSettings(android: android),
+      onDidReceiveNotificationResponse: (details) {
+        final payload = details.payload;
+        if (payload != null && payload.startsWith('msg:')) {
+          onNotificationTapped?.call(payload.replaceFirst('msg:', ''));
+        }
+      },
+    );
     const channel = AndroidNotificationChannel(
       _channelId,
       'Messages',
@@ -15,9 +25,9 @@ class MessageNotificationService {
       importance: Importance.high,
       playSound: false,
     );
-    await _plugin
-        .resolvePlatformSpecificImplementation<AndroidFlutterLocalNotificationsPlugin>()
-        ?.createNotificationChannel(channel);
+    final androidImpl = _plugin
+        .resolvePlatformSpecificImplementation<AndroidFlutterLocalNotificationsPlugin>();
+    await androidImpl?.createNotificationChannel(channel);
   }
 
   static Future<void> playMessageSound() async {
@@ -26,7 +36,7 @@ class MessageNotificationService {
     } catch (_) {}
   }
 
-  static Future<void> showMessageNotification(String senderName, String message) async {
+  static Future<void> showMessageNotification(String senderName, String message, {String? peerId}) async {
     const details = AndroidNotificationDetails(
       _channelId,
       'Messages',
@@ -41,7 +51,7 @@ class MessageNotificationService {
       senderName,
       message,
       const NotificationDetails(android: details),
-      payload: 'msg:$senderName',
+      payload: 'msg:${peerId ?? senderName}',
     );
   }
 }

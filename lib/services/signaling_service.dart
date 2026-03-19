@@ -1,4 +1,5 @@
 import 'dart:async';
+import 'dart:math';
 import '../config.dart';
 import 'dart:convert';
 import 'package:flutter_webrtc/flutter_webrtc.dart';
@@ -35,6 +36,27 @@ class SignalingService {
   RTCSessionDescription? _pendingCallOffer;
 
   Timer? _pingTimer;
+  Timer? _reconnectTimer;
+  int _reconnectAttempts = 0;
+  static const int _maxReconnectDelay = 30;
+
+  void _scheduleReconnect() {
+    if (_myId == null) return;
+    _reconnectTimer?.cancel();
+    final delay = min(_reconnectAttempts * 2 + 2, _maxReconnectDelay);
+    print('Reconnecting in \${delay}s (attempt \${_reconnectAttempts + 1})');
+    _reconnectTimer = Timer(Duration(seconds: delay), () async {
+      _reconnectAttempts++;
+      try {
+        await connect(_myId!, fcmToken: _fcmToken);
+        _reconnectAttempts = 0;
+        print('Reconnected successfully');
+      } catch (e) {
+        print('Reconnect failed: \$e');
+        _scheduleReconnect();
+      }
+    });
+  }
 
   Future<void> connect(String myId, {String? fcmToken}) async {
     _fcmToken = fcmToken;
@@ -262,6 +284,8 @@ class SignalingService {
 
   void disconnect() {
     _pingTimer?.cancel();
+    _reconnectTimer?.cancel();
+    _reconnectAttempts = 0;
     for (final p in _peers.values) p.dispose();
     _peers.clear();
     _idleTimers.values.forEach((t) => t.cancel());
