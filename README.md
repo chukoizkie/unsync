@@ -1,3 +1,6 @@
+> **Status:** Alpha / Personal Project
+> **Notice:** Read our [Development Disclaimer & AI Philosophy](./DISCLAIMER.md) before use
+
 # Unsync
 
 A privacy-first, peer-to-peer encrypted messenger for Android.
