@@ -1,9 +1,9 @@
 import 'dart:async';
-import 'dart:math';
-import '../config.dart';
 import 'dart:convert';
+import '../config.dart';
 import 'package:flutter_webrtc/flutter_webrtc.dart';
 import 'package:web_socket_channel/web_socket_channel.dart';
+import 'package:web_socket_channel/io.dart';
 import 'webrtc_service.dart';
 
 class SignalingService {
@@ -12,11 +12,8 @@ class SignalingService {
 
   WebSocketChannel? _channel;
 
-  // Active P2P connections: peerId → WebRTCService
   final Map<String, WebRTCService> _peers = {};
-  // Idle timers: peerId → Timer
   final Map<String, Timer> _idleTimers = {};
-  // Pending ICE candidates before connection is ready
   final Map<String, List<RTCIceCandidate>> _pendingIce = {};
 
   Function(String peerId, String message)? onMessageReceived;
@@ -26,43 +23,27 @@ class SignalingService {
   Function(String peerId)? onIncomingCall;
   Function()? onCallAnswered;
   Function()? onCallEnded;
+  Function(dynamic stream)? onRemoteStream;
 
   String? _myId;
   String? get myId => _myId;
   String? _fcmToken;
 
-  // Active voice call peer
+  // DHT identity — set before connecting
+  String? _myHandle;
+
   String? _callPeerId;
   RTCSessionDescription? _pendingCallOffer;
 
   Timer? _pingTimer;
   Timer? _reconnectTimer;
-  int _reconnectAttempts = 0;
-  static const int _maxReconnectDelay = 30;
 
-  void _scheduleReconnect() {
-    if (_myId == null) return;
-    _reconnectTimer?.cancel();
-    final delay = min(_reconnectAttempts * 2 + 2, _maxReconnectDelay);
-    print('Reconnecting in \${delay}s (attempt \${_reconnectAttempts + 1})');
-    _reconnectTimer = Timer(Duration(seconds: delay), () async {
-      _reconnectAttempts++;
-      try {
-        await connect(_myId!, fcmToken: _fcmToken);
-        _reconnectAttempts = 0;
-        print('Reconnected successfully');
-      } catch (e) {
-        print('Reconnect failed: \$e');
-        _scheduleReconnect();
-      }
-    });
-  }
-
-  Future<void> connect(String myId, {String? fcmToken}) async {
+  Future<void> connect(String myId, {String? fcmToken, String? handle}) async {
     _fcmToken = fcmToken;
-    _myId = myId;
+    _myId     = myId;
+    _myHandle = handle;
 
-    _channel = WebSocketChannel.connect(Uri.parse(signalingUrl));
+    _channel = IOWebSocketChannel.connect(Uri.parse(signalingUrl));
     _channel!.stream.listen((data) {
       final msg = jsonDecode(data as String);
       _handleMessage(msg);
@@ -89,7 +70,6 @@ class SignalingService {
         break;
 
       case 'knock':
-        // Peer wants to connect — wait for their offer
         print('Knock from: ${msg['from']}');
         break;
 
@@ -110,7 +90,6 @@ class SignalingService {
           await webrtc.setRemoteDescription(
             RTCSessionDescription(msg['sdp']['sdp'], msg['sdp']['type']),
           );
-          // Flush pending ICE
           final pending = _pendingIce.remove(fromId) ?? [];
           for (final c in pending) await webrtc.addIceCandidate(c);
         }
@@ -133,7 +112,7 @@ class SignalingService {
 
       case 'peer_offline':
         final id = msg['id'] as String;
-        print('Peer offline: \$id');
+        print('Peer offline: $id');
         _closePeer(id);
         onPeerOffline?.call(id);
         break;
@@ -171,7 +150,6 @@ class SignalingService {
     }
   }
 
-  // Get existing peer connection or negotiate a new one
   Future<WebRTCService> _getOrCreatePeer(String peerId,
       {bool isInitiator = true}) async {
     if (_peers.containsKey(peerId)) {
@@ -180,6 +158,19 @@ class SignalingService {
     }
 
     final webrtc = WebRTCService();
+
+    // ── DHT: inject our identity so peer can resolve our handle ──
+    webrtc.ownHandle = _myHandle;
+    webrtc.ownPeerId = _myId;
+    webrtc.onDhtMessage = (msg) {
+      // Handle dht_find — peer is looking for a handle
+      if (msg['type'] == 'dht_find') {
+        webrtc.handleDhtFind(msg);
+      }
+      // dht_announce / dht_found — just let browser handle via data channel
+    };
+    // ─────────────────────────────────────────────────────────────
+
     await webrtc.initialize();
     _peers[peerId] = webrtc;
 
@@ -193,6 +184,10 @@ class SignalingService {
         onPeerConnected?.call(peerId);
         _resetIdleTimer(peerId);
       }
+    };
+
+    webrtc.onRemoteStream = (stream) {
+      onRemoteStream?.call(stream);
     };
 
     webrtc.onIceCandidate((candidate) {
@@ -210,7 +205,6 @@ class SignalingService {
   }
 
   void _resetIdleTimer(String peerId) {
-    // Don't idle-close active call peer
     if (peerId == _callPeerId) return;
     _idleTimers[peerId]?.cancel();
     _idleTimers[peerId] = Timer(
@@ -223,14 +217,11 @@ class SignalingService {
     _idleTimers.remove(peerId)?.cancel();
     _pendingIce.remove(peerId);
     _peers.remove(peerId)?.dispose();
-    print('P2P connection closed: \$peerId');
+    print('P2P connection closed: $peerId');
   }
-
-  // ── PUBLIC API ─────────────────────────────────────────────────────────────
 
   Future<void> sendMessage(String peerId, String message) async {
     final webrtc = await _getOrCreatePeer(peerId);
-    // Wait up to 5s for data channel to open
     for (int i = 0; i < 50; i++) {
       if (webrtc.isDataChannelOpen) break;
       await Future.delayed(const Duration(milliseconds: 100));
@@ -257,6 +248,7 @@ class SignalingService {
   Future<void> acceptCall() async {
     if (_callPeerId == null || _pendingCallOffer == null) return;
     final webrtc = await _getOrCreatePeer(_callPeerId!, isInitiator: false);
+    await webrtc.addAudioTrack();
     final answer = await webrtc.createAnswer(_pendingCallOffer!, withAudio: true);
     _send({'type': 'call_answer', 'to': _callPeerId, 'sdp': answer.toMap()});
     _pendingCallOffer = null;
@@ -285,7 +277,6 @@ class SignalingService {
   void disconnect() {
     _pingTimer?.cancel();
     _reconnectTimer?.cancel();
-    _reconnectAttempts = 0;
     for (final p in _peers.values) p.dispose();
     _peers.clear();
     _idleTimers.values.forEach((t) => t.cancel());
