@@ -1,3 +1,4 @@
+import 'dart:async';
 import 'dart:convert';
 import 'package:flutter_webrtc/flutter_webrtc.dart';
 
@@ -5,6 +6,8 @@ class WebRTCService {
   RTCPeerConnection? _peerConnection;
   RTCDataChannel? _dataChannel;
   MediaStream? _localStream;
+  bool _isRemoteDescriptionSet = false;
+  final List<RTCIceCandidate> _iceCandidateBuffer = [];
 
   // DHT identity — set by SignalingService before use
   String? ownHandle;
@@ -21,6 +24,11 @@ class WebRTCService {
     'iceServers': [
       {'urls': 'stun:stun.l.google.com:19302'},
       {'urls': 'stun:stun1.l.google.com:19302'},
+      {
+        'urls': 'turn:64.188.17.219:3478',
+        'username': 'unsync',
+        'credential': 'unsync123',
+      },
     ]
   };
 
@@ -36,10 +44,13 @@ class WebRTCService {
 
     _peerConnection!.onIceConnectionState = (state) {
       print('ICE state: $state');
-      onConnectionStateChanged?.call(
-        state == RTCIceConnectionState.RTCIceConnectionStateConnected ||
-        state == RTCIceConnectionState.RTCIceConnectionStateCompleted
-      );
+      final connected =
+          state == RTCIceConnectionState.RTCIceConnectionStateConnected ||
+          state == RTCIceConnectionState.RTCIceConnectionStateCompleted;
+      if (connected) {
+        unawaited(_activateAudioRoute());
+      }
+      onConnectionStateChanged?.call(connected);
     };
 
     _peerConnection!.onDataChannel = (channel) {
@@ -135,15 +146,38 @@ class WebRTCService {
     return _dataChannel!;
   }
 
+  Future<RTCDataChannel> ensureDataChannel() async {
+    if (_dataChannel != null) return _dataChannel!;
+    return createDataChannel();
+  }
+
   // ── AUDIO ─────────────────────────────────────────────────────────────────
 
   Future<void> addAudioTrack() async {
-    _localStream = await navigator.mediaDevices.getUserMedia({
-      'audio': true,
-      'video': false,
-    });
-    for (final track in _localStream!.getAudioTracks()) {
-      await _peerConnection!.addTrack(track, _localStream!);
+    try {
+      _localStream = await navigator.mediaDevices.getUserMedia({
+        'audio': true,
+        'video': false,
+      });
+      final audioTracks = _localStream!.getAudioTracks();
+      for (final track in audioTracks) {
+        await _peerConnection!.addTrack(track, _localStream!);
+      }
+      for (final track in audioTracks) {
+        track.enabled = true;
+      }
+    } catch (e) {
+      print('Audio initialization failed: $e');
+      await _disposeLocalPeerConnectionState();
+      rethrow;
+    }
+  }
+
+  Future<void> _activateAudioRoute() async {
+    try {
+      await Helper.setSpeakerphoneOn(false);
+    } catch (e) {
+      print('Audio route activation failed: $e');
     }
   }
 
@@ -153,17 +187,31 @@ class WebRTCService {
     _localStream = null;
   }
 
+  Future<void> _disposeLocalPeerConnectionState() async {
+    await stopAudio();
+    _dataChannel?.close();
+    _dataChannel = null;
+    await _peerConnection?.close();
+    _peerConnection = null;
+    _isRemoteDescriptionSet = false;
+    _iceCandidateBuffer.clear();
+  }
+
   void setMicMuted(bool muted) {
     _localStream?.getAudioTracks().forEach((t) => t.enabled = !muted);
   }
 
   bool get isAudioActive => _localStream != null;
 
+  bool get isSignalingStable =>
+      _peerConnection?.signalingState ==
+      RTCSignalingState.RTCSignalingStateStable;
+
   // ── SIGNALING ─────────────────────────────────────────────────────────────
 
   Future<RTCSessionDescription> createOffer({bool withAudio = false}) async {
-    await createDataChannel();
-    if (withAudio) await addAudioTrack();
+    await ensureDataChannel();
+    if (withAudio && !isAudioActive) await addAudioTrack();
     final offer = await _peerConnection!.createOffer();
     await _peerConnection!.setLocalDescription(offer);
     return offer;
@@ -172,6 +220,7 @@ class WebRTCService {
   Future<RTCSessionDescription> createAnswer(RTCSessionDescription offer,
       {bool withAudio = false}) async {
     await _peerConnection!.setRemoteDescription(offer);
+    await _markRemoteDescriptionSetAndDrainIce();
     if (withAudio) await addAudioTrack();
     final answer = await _peerConnection!.createAnswer();
     await _peerConnection!.setLocalDescription(answer);
@@ -180,10 +229,28 @@ class WebRTCService {
 
   Future<void> setRemoteDescription(RTCSessionDescription description) async {
     await _peerConnection!.setRemoteDescription(description);
+    await _markRemoteDescriptionSetAndDrainIce();
+  }
+
+  Future<void> _markRemoteDescriptionSetAndDrainIce() async {
+    _isRemoteDescriptionSet = true;
+    final buffered = List<RTCIceCandidate>.from(_iceCandidateBuffer);
+    _iceCandidateBuffer.clear();
+    for (final candidate in buffered) {
+      await _peerConnection!.addCandidate(candidate);
+    }
+  }
+
+  Future<void> safeAddIceCandidate(RTCIceCandidate candidate) async {
+    if (_isRemoteDescriptionSet) {
+      await _peerConnection!.addCandidate(candidate);
+      return;
+    }
+    _iceCandidateBuffer.add(candidate);
   }
 
   Future<void> addIceCandidate(RTCIceCandidate candidate) async {
-    await _peerConnection!.addCandidate(candidate);
+    await safeAddIceCandidate(candidate);
   }
 
   void onIceCandidate(Function(RTCIceCandidate) callback) {
@@ -200,8 +267,6 @@ class WebRTCService {
   }
 
   void dispose() {
-    stopAudio();
-    _dataChannel?.close();
-    _peerConnection?.close();
+    _disposeLocalPeerConnectionState();
   }
 }

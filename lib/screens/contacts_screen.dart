@@ -42,11 +42,66 @@ class _ContactsScreenState extends State<ContactsScreen> {
   List<SavedContact> _realContacts = [];
   final _newMessageNotifier  = ValueNotifier<String>('');
   final _connectionNotifier  = ValueNotifier<bool>(false);
+  String? _pendingCallPeerId;
+  bool _incomingCallRouteOpen = false;
 
   @override
   void initState() {
     super.initState();
     _connect();
+  }
+
+  void _queueIncomingCallRoute(String callerId) {
+    _pendingCallPeerId = callerId;
+    _drainPendingCallRoute();
+  }
+
+  void _drainPendingCallRoute() {
+    if (!mounted) return;
+    if (_incomingCallRouteOpen) return;
+    final callerId = _pendingCallPeerId;
+    if (callerId == null) return;
+
+    _pendingCallPeerId = null;
+    _incomingCallRouteOpen = true;
+
+    final fallbackName = CallNotificationService.lastCallerName ?? callerId;
+    final saved = _realContacts.firstWhere(
+      (c) => c.peerId == callerId,
+      orElse: () => SavedContact(
+        peerId: callerId,
+        displayName: fallbackName,
+        addedAt: DateTime.now(),
+      ),
+    );
+
+    Navigator.push(
+      context,
+      MaterialPageRoute(
+        builder: (_) => IncomingCallScreen(
+          callerName: saved.displayName,
+          onDecline: () {
+            _signaling.declineCall();
+            try { CallNotificationService.cancel(); } catch (_) {}
+            Navigator.pop(context);
+          },
+          onAccept: () async {
+            try { CallNotificationService.cancel(); } catch (_) {}
+            await _signaling.acceptCall();
+            if (context.mounted) {
+              Navigator.pushReplacement(
+                context,
+                MaterialPageRoute(
+                  builder: (_) => _buildCallScreen(saved.displayName, false),
+                ),
+              );
+            }
+          },
+        ),
+      ),
+    ).whenComplete(() {
+      _incomingCallRouteOpen = false;
+    });
   }
 
   Future<void> _connect() async {
@@ -88,54 +143,31 @@ class _ContactsScreenState extends State<ContactsScreen> {
             myName: _identity.displayName,
             onProcessBundle: (pid, bundle) async =>
                 await _signalService.processPreKeyBundleFromMap(pid, bundle),
+            onInitializeSession: (pid, bundle) async =>
+                await _signalService.initializeSession(pid, bundle),
             messagesService: _messagesService,
             newMessageNotifier: _newMessageNotifier,
             onMessageSaved: (text, isSent) =>
                 _messagesService.addMessage(contact.id, text, isSent),
             onEncrypt: (text) async {
               if (_signalService.isInitialized) {
-                try { return await _signalService.encrypt(contact.id, text); }
-                catch (e) { print('Encrypt error: \$e'); }
+                return await _signalService.encrypt(contact.id, text);
               }
-              return text;
+              throw SignalSessionMissingException(contact.id);
             },
           ),
         ));
       };
 
       CallNotificationService.onNotificationTapped = (callerId) {
-        final fallbackName = CallNotificationService.lastCallerName ?? callerId;
-        final saved = _realContacts.firstWhere(
-          (c) => c.peerId == callerId,
-          orElse: () => SavedContact(peerId: callerId, displayName: fallbackName, addedAt: DateTime.now()),
-        );
-        if (!mounted) return;
-        Navigator.push(context, MaterialPageRoute(
-          builder: (_) => IncomingCallScreen(
-            callerName: saved.displayName,
-            onDecline: () {
-              _signaling.declineCall();
-              try { CallNotificationService.cancel(); } catch (_) {}
-              Navigator.pop(context);
-            },
-            onAccept: () async {
-              try { CallNotificationService.cancel(); } catch (_) {}
-              await _signaling.acceptCall();
-              if (context.mounted) {
-                Navigator.pushReplacement(context, MaterialPageRoute(
-                  builder: (_) => _buildCallScreen(saved.displayName, false),
-                ));
-              }
-            },
-          ),
-        ));
+        _queueIncomingCallRoute(callerId);
       };
 
       // ── FCM ────────────────────────────────────────────────────────────────
-      await FCMService.initialize();
+      final fcmToken = await FCMService.initialize();
 
       // ── relay ──────────────────────────────────────────────────────────────
-      await _relayService.connect(id);
+      await _relayService.connect(id, fcmToken: fcmToken);
 
       Future.delayed(const Duration(seconds: 2), () async {
         try {
@@ -192,26 +224,7 @@ class _ContactsScreenState extends State<ContactsScreen> {
           orElse: () => SavedContact(peerId: peerId, displayName: peerId, addedAt: DateTime.now()),
         );
         await CallNotificationService.showIncomingCall(saved.displayName, peerId);
-        if (!mounted) return;
-        Navigator.push(context, MaterialPageRoute(
-          builder: (_) => IncomingCallScreen(
-            callerName: saved.displayName,
-            onDecline: () {
-              _signaling.declineCall();
-              try { CallNotificationService.cancel(); } catch (_) {}
-              Navigator.pop(context);
-            },
-            onAccept: () async {
-              try { CallNotificationService.cancel(); } catch (_) {}
-              await _signaling.acceptCall();
-              if (context.mounted) {
-                Navigator.pushReplacement(context, MaterialPageRoute(
-                  builder: (_) => _buildCallScreen(saved.displayName, false),
-                ));
-              }
-            },
-          ),
-        ));
+        _queueIncomingCallRoute(peerId);
       };
 
       _signaling.onCallEnded = () {
@@ -227,7 +240,7 @@ class _ContactsScreenState extends State<ContactsScreen> {
             await Future.delayed(const Duration(milliseconds: 500));
             if (_signaling.myId != null && _realContacts.isNotEmpty) break;
           }
-          if (mounted) CallNotificationService.onNotificationTapped?.call(initialCallerId);
+          if (mounted) _queueIncomingCallRoute(initialCallerId);
         }
 
         final initialPeerId = await MessageNotificationService.getInitialPeerId();
@@ -283,19 +296,33 @@ class _ContactsScreenState extends State<ContactsScreen> {
 
         String plaintext = msg;
         if (_signalService.isInitialized) {
-          try { plaintext = await _signalService.decrypt(peerId, msg); }
-          catch (e) { print('Decrypt error: \$e'); }
+          try {
+            plaintext = await _signalService.decrypt(peerId, msg);
+          } catch (e) {
+            print('Decrypt error: \$e');
+          }
         }
         _messagesService.addMessage(peerId, plaintext, false).then((_) {
-          if (mounted) setState(() {
-            _newMessageNotifier.value = '\$peerId:\${DateTime.now().millisecondsSinceEpoch}';
-            MessageNotificationService.playMessageSound();
-            final senderName = _realContacts.firstWhere(
-              (c) => c.peerId == peerId,
-              orElse: () => SavedContact(peerId: peerId, displayName: peerId, addedAt: DateTime.now()),
-            ).displayName;
-            MessageNotificationService.showMessageNotification(senderName, plaintext, peerId: peerId);
-          });
+          if (mounted) {
+            setState(() {
+              _newMessageNotifier.value =
+                  '\$peerId:\${DateTime.now().millisecondsSinceEpoch}';
+              MessageNotificationService.playMessageSound();
+              final senderName = _realContacts.firstWhere(
+                (c) => c.peerId == peerId,
+                orElse: () => SavedContact(
+                  peerId: peerId,
+                  displayName: peerId,
+                  addedAt: DateTime.now(),
+                ),
+              ).displayName;
+              MessageNotificationService.showMessageNotification(
+                senderName,
+                plaintext,
+                peerId: peerId,
+              );
+            });
+          }
         });
       };
 
@@ -320,11 +347,13 @@ class _ContactsScreenState extends State<ContactsScreen> {
         }));
       };
 
-      await _signaling.connect(id, fcmToken: await FCMService.getToken(), handle: _identity.displayName);
+      await _signaling.connect(id, fcmToken: fcmToken, handle: _identity.displayName);
       ForegroundServiceManager.start();
 
       FirebaseMessaging.onMessage.listen((message) {
-        if (!_relayService.isConnected) _relayService.connect(id);
+        if (!_relayService.isConnected) {
+          _relayService.connect(id, fcmToken: fcmToken);
+        }
       });
 
     } catch (e, stack) {
@@ -533,7 +562,7 @@ class _ContactsScreenState extends State<ContactsScreen> {
           Expanded(
             child: ListView.separated(
               itemCount: _realContacts.length,
-              separatorBuilder: (_, __) => Container(height: 1, color: kBorder),
+              separatorBuilder: (_, _) => Container(height: 1, color: kBorder),
               itemBuilder: (context, index) {
                 if (index >= _realContacts.length) return const SizedBox.shrink();
                 final c = _realContacts[index];
@@ -565,16 +594,17 @@ class _ContactsScreenState extends State<ContactsScreen> {
                         myName: _identity.displayName,
                         onProcessBundle: (pid, bundle) async =>
                             await _signalService.processPreKeyBundleFromMap(pid, bundle),
+                        onInitializeSession: (pid, bundle) async =>
+                            await _signalService.initializeSession(pid, bundle),
                         messagesService: _messagesService,
                         newMessageNotifier: _newMessageNotifier,
                         onMessageSaved: (text, isSent) =>
                             _messagesService.addMessage(contact.id, text, isSent),
                         onEncrypt: (text) async {
                           if (_signalService.isInitialized) {
-                            try { return await _signalService.encrypt(contact.id, text); }
-                            catch (e) { print('Encrypt error: \$e'); }
+                            return await _signalService.encrypt(contact.id, text);
                           }
-                          return text;
+                          throw SignalSessionMissingException(contact.id);
                         },
                       ),
                     ));

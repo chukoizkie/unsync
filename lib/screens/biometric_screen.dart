@@ -1,10 +1,6 @@
 import 'package:flutter/material.dart';
+import '../theme.dart';
 import '../services/biometric_service.dart';
-
-const kBg = Color(0xFF080808);
-const kAccent = Color(0xFF00FF87);
-const kMuted = Color(0xFF555555);
-const kText = Color(0xFFF0F0F0);
 
 class BiometricScreen extends StatefulWidget {
   final Widget destination;
@@ -28,10 +24,8 @@ class _BiometricScreenState extends State<BiometricScreen> {
     try {
       final result = await BiometricService.authenticate();
       if (result && mounted) {
-        Navigator.pushReplacement(
-          context,
-          MaterialPageRoute(builder: (_) => widget.destination),
-        );
+        Navigator.pushReplacement(context,
+          MaterialPageRoute(builder: (_) => widget.destination));
       } else if (mounted) {
         setState(() => _failed = true);
       }
@@ -54,7 +48,10 @@ class _BiometricScreenState extends State<BiometricScreen> {
             const SizedBox(height: 8),
             Text(
               _failed ? 'Authentication failed' : 'Touch fingerprint sensor',
-              style: TextStyle(color: _failed ? Colors.redAccent : kMuted, fontSize: 13),
+              style: TextStyle(
+                color: _failed ? Colors.redAccent : kMuted,
+                fontSize: 13,
+              ),
             ),
             const SizedBox(height: 24),
             GestureDetector(
@@ -64,7 +61,10 @@ class _BiometricScreenState extends State<BiometricScreen> {
                 decoration: BoxDecoration(
                   shape: BoxShape.circle,
                   color: kAccent.withAlpha(20),
-                  border: Border.all(color: _failed ? Colors.redAccent : kAccent, width: 1.5),
+                  border: Border.all(
+                    color: _failed ? Colors.redAccent : kAccent,
+                    width: 1.5,
+                  ),
                 ),
                 child: Icon(Icons.fingerprint,
                   color: _failed ? Colors.redAccent : kAccent, size: 40),

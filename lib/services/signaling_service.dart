@@ -14,7 +14,6 @@ class SignalingService {
 
   final Map<String, WebRTCService> _peers = {};
   final Map<String, Timer> _idleTimers = {};
-  final Map<String, List<RTCIceCandidate>> _pendingIce = {};
 
   Function(String peerId, String message)? onMessageReceived;
   Function(bool connected)? onConnectionStateChanged;
@@ -50,18 +49,37 @@ class SignalingService {
     }, onError: (e) {
       print('Signaling error: $e');
       onConnectionStateChanged?.call(false);
+      _scheduleReconnect();
     }, onDone: () {
       print('Signaling disconnected');
       onConnectionStateChanged?.call(false);
+      _scheduleReconnect();
     });
 
     _send({'type': 'register', 'id': myId, 'fcmToken': _fcmToken});
+  }
+
+  int _reconnectAttempt = 0;
+  void _scheduleReconnect() {
+    _reconnectTimer?.cancel();
+    if (_myId == null) return;
+    final delays = [1, 2, 5, 10, 30, 60];
+    final delaySecs = delays[_reconnectAttempt.clamp(0, delays.length - 1)];
+    _reconnectAttempt++;
+    print('Signaling reconnect in ${delaySecs}s (attempt $_reconnectAttempt)');
+    _reconnectTimer = Timer(Duration(seconds: delaySecs), () async {
+      if (_myId != null) {
+        print('Signaling reconnecting...');
+        await connect(_myId!, fcmToken: _fcmToken, handle: _myHandle);
+      }
+    });
   }
 
   void _handleMessage(Map<String, dynamic> msg) async {
     switch (msg['type']) {
       case 'registered':
         print('Registered as: ${msg['id']}');
+        _reconnectAttempt = 0;
         onConnectionStateChanged?.call(true);
         _pingTimer?.cancel();
         _pingTimer = Timer.periodic(const Duration(seconds: 30), (_) {
@@ -90,8 +108,6 @@ class SignalingService {
           await webrtc.setRemoteDescription(
             RTCSessionDescription(msg['sdp']['sdp'], msg['sdp']['type']),
           );
-          final pending = _pendingIce.remove(fromId) ?? [];
-          for (final c in pending) await webrtc.addIceCandidate(c);
         }
         break;
 
@@ -102,12 +118,8 @@ class SignalingService {
           msg['candidate']['sdpMid'],
           msg['candidate']['sdpMLineIndex'],
         );
-        final webrtc = _peers[fromId];
-        if (webrtc != null) {
-          await webrtc.addIceCandidate(candidate);
-        } else {
-          _pendingIce.putIfAbsent(fromId, () => []).add(candidate);
-        }
+        final webrtc = await _getOrCreatePeer(fromId, isInitiator: false);
+        await webrtc.addIceCandidate(candidate);
         break;
 
       case 'peer_offline':
@@ -119,8 +131,19 @@ class SignalingService {
 
       case 'call_offer':
         final fromId = msg['from'] as String;
+        final offer = RTCSessionDescription(
+          msg['sdp']['sdp'],
+          msg['sdp']['type'],
+        );
+        if (_callPeerId == fromId) {
+          print(
+            'Call offer received via WebSocket, but UI is already active. Updating SDP.',
+          );
+          _pendingCallOffer = offer;
+          break;
+        }
         _callPeerId = fromId;
-        _pendingCallOffer = RTCSessionDescription(msg['sdp']['sdp'], msg['sdp']['type']);
+        _pendingCallOffer = offer;
         onIncomingCall?.call(fromId);
         break;
 
@@ -151,7 +174,7 @@ class SignalingService {
   }
 
   Future<WebRTCService> _getOrCreatePeer(String peerId,
-      {bool isInitiator = true}) async {
+      {bool isInitiator = true, bool sendInitialOffer = true}) async {
     if (_peers.containsKey(peerId)) {
       _resetIdleTimer(peerId);
       return _peers[peerId]!;
@@ -194,7 +217,7 @@ class SignalingService {
       _send({'type': 'ice', 'to': peerId, 'candidate': candidate.toMap()});
     });
 
-    if (isInitiator) {
+    if (isInitiator && sendInitialOffer) {
       _send({'type': 'knock', 'to': peerId});
       final offer = await webrtc.createOffer();
       _send({'type': 'offer', 'to': peerId, 'sdp': offer.toMap()});
@@ -215,7 +238,6 @@ class SignalingService {
 
   void _closePeer(String peerId) {
     _idleTimers.remove(peerId)?.cancel();
-    _pendingIce.remove(peerId);
     _peers.remove(peerId)?.dispose();
     print('P2P connection closed: $peerId');
   }
@@ -233,10 +255,26 @@ class SignalingService {
   Future<void> startVoiceCall(String peerId, {String? callerName}) async {
     _callPeerId = peerId;
     _idleTimers[peerId]?.cancel();
-    final webrtc = await _getOrCreatePeer(peerId);
-    await webrtc.addAudioTrack();
-    final offer = await webrtc.createOffer(withAudio: true);
-    _send({'type': 'call_offer', 'to': peerId, 'sdp': offer.toMap(), 'callerName': callerName ?? _myId ?? ''});
+    try {
+      final webrtc = await _getOrCreatePeer(peerId, sendInitialOffer: false);
+      await webrtc.ensureDataChannel();
+      if (!webrtc.isAudioActive) {
+        await webrtc.addAudioTrack();
+      }
+      final offer = await webrtc.createOffer();
+      _send({
+        'type': 'call_offer',
+        'to': peerId,
+        'sdp': offer.toMap(),
+        'callerName': callerName ?? _myId ?? '',
+      });
+    } catch (e) {
+      print('Voice call setup failed for $peerId: $e');
+      _send({'type': 'call_declined', 'to': peerId});
+      _closePeer(peerId);
+      if (_callPeerId == peerId) _callPeerId = null;
+      onCallEnded?.call();
+    }
   }
 
   void setMicMuted(bool muted) {
@@ -247,11 +285,20 @@ class SignalingService {
 
   Future<void> acceptCall() async {
     if (_callPeerId == null || _pendingCallOffer == null) return;
-    final webrtc = await _getOrCreatePeer(_callPeerId!, isInitiator: false);
-    await webrtc.addAudioTrack();
-    final answer = await webrtc.createAnswer(_pendingCallOffer!, withAudio: true);
-    _send({'type': 'call_answer', 'to': _callPeerId, 'sdp': answer.toMap()});
-    _pendingCallOffer = null;
+    final peerId = _callPeerId!;
+    try {
+      final webrtc = await _getOrCreatePeer(peerId, isInitiator: false);
+      final answer = await webrtc.createAnswer(_pendingCallOffer!, withAudio: true);
+      _send({'type': 'call_answer', 'to': peerId, 'sdp': answer.toMap()});
+      _pendingCallOffer = null;
+    } catch (e) {
+      print('Accept call failed for $peerId: $e');
+      _send({'type': 'call_declined', 'to': peerId});
+      _closePeer(peerId);
+      if (_callPeerId == peerId) _callPeerId = null;
+      _pendingCallOffer = null;
+      onCallEnded?.call();
+    }
   }
 
   void declineCall() {
@@ -277,9 +324,13 @@ class SignalingService {
   void disconnect() {
     _pingTimer?.cancel();
     _reconnectTimer?.cancel();
-    for (final p in _peers.values) p.dispose();
+    for (final p in _peers.values) {
+      p.dispose();
+    }
     _peers.clear();
-    _idleTimers.values.forEach((t) => t.cancel());
+    for (var t in _idleTimers.values) {
+      t.cancel();
+    }
     _idleTimers.clear();
     _channel?.sink.close();
     _myId = null;

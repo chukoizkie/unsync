@@ -1,46 +1,54 @@
 import 'dart:async';
 import 'dart:convert';
 import '../config.dart';
+import 'package:web_socket_channel/io.dart';
 import 'package:web_socket_channel/web_socket_channel.dart';
 
 class RelayService {
   static const String _relayUrl = UnsyncConfig.relayUrl;
   WebSocketChannel? _channel;
-  String? _myId;
   bool _connected = false;
   bool _reconnecting = false;
   Timer? _pingTimer;
   Function(String from, String payload)? onQueuedMessage;
   final Map<String, Completer<Map<String, dynamic>?>> _bundleCompleters = {};
 
-  Future<void> connect(String myId) async {
+  Future<void> connect(String myId, {String? fcmToken}) async {
     if (_reconnecting) return;
     _reconnecting = true;
-    _myId = myId;
     try {
-      _channel = WebSocketChannel.connect(Uri.parse(_relayUrl));
+      _channel = IOWebSocketChannel.connect(Uri.parse(_relayUrl));
       _channel!.stream.listen(
         (data) => _handleMessage(data),
         onDone: () {
           _connected = false;
           print('Relay disconnected');
-          Future.delayed(const Duration(seconds: 10), () => connect(myId));
+          Future.delayed(
+            const Duration(seconds: 10),
+            () => connect(myId, fcmToken: fcmToken),
+          );
         },
         onError: (e) {
           _connected = false;
-          print('Relay error: ' + e.toString());
-          Future.delayed(const Duration(seconds: 10), () => connect(myId));
+          print('Relay error: $e');
+          Future.delayed(
+            const Duration(seconds: 10),
+            () => connect(myId, fcmToken: fcmToken),
+          );
         },
         cancelOnError: false,
       );
-      _send({'type': 'register', 'id': myId});
+      _send({'type': 'register', 'id': myId, 'fcmToken': fcmToken});
       _connected = true;
       _reconnecting = false;
       _startPing();
-      print('Relay connected as ' + myId);
+      print('Relay connected as $myId');
     } catch (e) {
-      print('Relay connect failed: ' + e.toString());
-      Future.delayed(const Duration(seconds: 10), () => connect(myId));
+      print('Relay connect failed: $e');
+      Future.delayed(
+        const Duration(seconds: 10),
+        () => connect(myId, fcmToken: fcmToken),
+      );
     }
   }
 
@@ -50,17 +58,17 @@ class RelayService {
       final type = msg['type'] as String?;
       switch (type) {
         case 'registered':
-          print('Relay registered: ' + msg['id'].toString());
+          print('Relay registered: ${msg['id']}');
           break;
         case 'queued':
-          print('Relay: queued from ' + msg['from'].toString());
+          print('Relay: queued from ${msg['from']}');
           onQueuedMessage?.call(msg['from'] as String, msg['payload'] as String);
           break;
         case 'stored':
-          print('Relay: blob stored for ' + msg['to'].toString());
+          print('Relay: blob stored for ${msg['to']}');
           break;
         case 'bundle_uploaded':
-          print('Relay: bundle uploaded for ' + msg['id'].toString());
+          print('Relay: bundle uploaded for ${msg['id']}');
           break;
         case 'bundle':
           final id = msg['id'] as String;
@@ -74,7 +82,7 @@ class RelayService {
           break;
       }
     } catch (e) {
-      print('Relay handle error: ' + e.toString());
+      print('Relay handle error: $e');
     }
   }
 
@@ -92,6 +100,8 @@ class RelayService {
       return null;
     });
   }
+
+  Future<Map<String, dynamic>?> getBundle(String peerId) => fetchBundle(peerId);
 
   void storeMessage(String to, String from, String encryptedPayload) {
     if (!_connected) {

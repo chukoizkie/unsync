@@ -1,28 +1,45 @@
-import 'dart:typed_data';
-import 'package:libsignal_protocol_dart/libsignal_protocol_dart.dart';
-import 'package:shared_preferences/shared_preferences.dart';
 import 'dart:convert';
+import 'dart:typed_data';
+
+import 'package:flutter_secure_storage/flutter_secure_storage.dart';
+import 'package:libsignal_protocol_dart/libsignal_protocol_dart.dart';
+
+class SignalSessionMissingException implements Exception {
+  final String peerId;
+  final Object? cause;
+
+  SignalSessionMissingException(this.peerId, [this.cause]);
+
+  @override
+  String toString() {
+    final suffix = cause == null ? '' : ': $cause';
+    return 'SignalSessionMissingException($peerId)$suffix';
+  }
+}
 
 class _PersistentSignalStore extends InMemorySignalProtocolStore {
-  SharedPreferences? _prefs;
+  final FlutterSecureStorage _secureStorage;
   static const _sessionsKey = 'signal_sessions';
 
-  _PersistentSignalStore(super.keyPair, super.registrationId);
+  _PersistentSignalStore(
+    super.keyPair,
+    super.registrationId,
+    this._secureStorage,
+  );
 
-  Future<void> initPrefs(SharedPreferences prefs) async {
-    _prefs = prefs;
+  Future<void> init() async {
     await _loadSessions();
   }
 
   Future<void> _loadSessions() async {
-    final raw = _prefs?.getString(_sessionsKey);
+    final raw = await _secureStorage.read(key: _sessionsKey);
     if (raw == null) return;
     try {
       final map = jsonDecode(raw) as Map<String, dynamic>;
       for (final entry in map.entries) {
         final address = SignalProtocolAddress(entry.key, 1);
         final sessionRecord = SessionRecord.fromSerialized(
-          base64Decode(entry.value as String)
+          base64Decode(entry.value as String),
         );
         await super.storeSession(address, sessionRecord);
       }
@@ -30,48 +47,38 @@ class _PersistentSignalStore extends InMemorySignalProtocolStore {
   }
 
   @override
-  Future<void> storeSession(SignalProtocolAddress address, SessionRecord record) async {
+  Future<void> storeSession(
+    SignalProtocolAddress address,
+    SessionRecord record,
+  ) async {
     await super.storeSession(address, record);
-    await _persistSessions();
-  }
-
-  Future<void> _persistSessions() async {
-    if (_prefs == null) return;
-    final allSessions = <String, String>{};
-    // Persist by iterating known session addresses
-    final raw = _prefs?.getString(_sessionsKey);
-    Map<String, dynamic> existing = {};
-    if (raw != null) {
-      try { existing = jsonDecode(raw) as Map<String, dynamic>; } catch (_) {}
-    }
-    for (final key in existing.keys) {
-      final address = SignalProtocolAddress(key, 1);
-      final record = await super.loadSession(address);
-      if (record != null) {
-        allSessions[key] = base64Encode(record.serialize());
-      }
-    }
-    await _prefs!.setString(_sessionsKey, jsonEncode(allSessions));
+    await _writeSessionRecord(address.getName(), record);
   }
 
   Future<void> persistSession(String peerId) async {
-    if (_prefs == null) return;
     final address = SignalProtocolAddress(peerId, 1);
     final record = await super.loadSession(address);
-    if (record == null) return;
-    final raw = _prefs?.getString(_sessionsKey);
+    await _writeSessionRecord(peerId, record);
+  }
+
+  Future<void> _writeSessionRecord(String peerId, SessionRecord record) async {
+    final raw = await _secureStorage.read(key: _sessionsKey);
     Map<String, dynamic> existing = {};
     if (raw != null) {
       try { existing = jsonDecode(raw) as Map<String, dynamic>; } catch (_) {}
     }
     existing[peerId] = base64Encode(record.serialize());
-    await _prefs!.setString(_sessionsKey, jsonEncode(existing));
+    await _secureStorage.write(
+      key: _sessionsKey,
+      value: jsonEncode(existing),
+    );
   }
 }
 
 class SignalService {
   static const _keyIdentityKeyPair = 'signal_identity_key_pair';
   static const _keyRegistrationId = 'signal_registration_id';
+  final FlutterSecureStorage _secureStorage;
 
   IdentityKeyPair? _identityKeyPair;
   int? _registrationId;
@@ -79,29 +86,39 @@ class SignalService {
 
   final Map<String, SessionCipher> _sessions = {};
 
-  Future<void> initialize() async {
-    final prefs = await SharedPreferences.getInstance();
+  SignalService({FlutterSecureStorage? secureStorage})
+      : _secureStorage = secureStorage ?? const FlutterSecureStorage();
 
-    final storedKeyPair = prefs.getString(_keyIdentityKeyPair);
+  Future<void> initialize() async {
+    final storedKeyPair = await _secureStorage.read(key: _keyIdentityKeyPair);
     if (storedKeyPair != null) {
       final bytes = base64Decode(storedKeyPair);
       _identityKeyPair = IdentityKeyPair.fromSerialized(bytes);
     } else {
       _identityKeyPair = generateIdentityKeyPair();
-      await prefs.setString(
-        _keyIdentityKeyPair,
-        base64Encode(_identityKeyPair!.serialize()),
+      await _secureStorage.write(
+        key: _keyIdentityKeyPair,
+        value: base64Encode(_identityKeyPair!.serialize()),
       );
     }
 
-    _registrationId = prefs.getInt(_keyRegistrationId);
+    final storedRegistrationId =
+        await _secureStorage.read(key: _keyRegistrationId);
+    _registrationId = int.tryParse(storedRegistrationId ?? '');
     if (_registrationId == null) {
       _registrationId = generateRegistrationId(false);
-      await prefs.setInt(_keyRegistrationId, _registrationId!);
+      await _secureStorage.write(
+        key: _keyRegistrationId,
+        value: _registrationId.toString(),
+      );
     }
 
-    _store = _PersistentSignalStore(_identityKeyPair!, _registrationId!);
-    await _store!.initPrefs(prefs);
+    _store = _PersistentSignalStore(
+      _identityKeyPair!,
+      _registrationId!,
+      _secureStorage,
+    );
+    await _store!.init();
 
     final preKeys = generatePreKeys(0, 5);
     for (final preKey in preKeys) {
@@ -156,6 +173,13 @@ class SignalService {
     await _store!.persistSession(peerId);
   }
 
+  Future<void> initializeSession(
+    String peerId,
+    Map<String, dynamic> bundle,
+  ) async {
+    await processPreKeyBundleFromMap(peerId, bundle);
+  }
+
   Future<void> processPreKeyBundle(String peerId, PreKeyBundle bundle) async {
     final address = SignalProtocolAddress(peerId, 1);
     final sessionBuilder = SessionBuilder.fromSignalStore(_store!, address);
@@ -164,17 +188,26 @@ class SignalService {
   }
 
   Future<String> encrypt(String peerId, String plaintext) async {
-    final address = SignalProtocolAddress(peerId, 1);
-    if (!_sessions.containsKey(peerId)) {
-      _sessions[peerId] = SessionCipher.fromStore(_store!, address);
+    final store = _store;
+    if (store == null) {
+      throw SignalSessionMissingException(peerId);
     }
-    final cipher = _sessions[peerId]!;
-    final encrypted = await cipher.encrypt(
-      Uint8List.fromList(utf8.encode(plaintext))
-    );
-    final result = base64Encode(encrypted.serialize());
-    await _store!.persistSession(peerId);
-    return result;
+
+    try {
+      final address = SignalProtocolAddress(peerId, 1);
+      final cipher = _sessions[peerId] ?? SessionCipher.fromStore(store, address);
+      _sessions[peerId] = cipher;
+
+      final encrypted = await cipher.encrypt(
+        Uint8List.fromList(utf8.encode(plaintext)),
+      );
+      final result = base64Encode(encrypted.serialize());
+      await store.persistSession(peerId);
+      return result;
+    } catch (e) {
+      _sessions.remove(peerId);
+      throw SignalSessionMissingException(peerId, e);
+    }
   }
 
   Future<String> decrypt(String peerId, String ciphertext) async {
@@ -186,14 +219,20 @@ class SignalService {
     final bytes = base64Decode(ciphertext);
     Uint8List decrypted;
     try {
-      final preKeyMessage = PreKeySignalMessage(bytes);
-      decrypted = await cipher.decrypt(preKeyMessage);
-    } catch (_) {
-      final message = SignalMessage.fromSerialized(bytes);
-      decrypted = await cipher.decryptFromSignal(message);
+      try {
+        final preKeyMessage = PreKeySignalMessage(bytes);
+        decrypted = await cipher.decrypt(preKeyMessage);
+      } catch (_) {
+        final message = SignalMessage.fromSerialized(bytes);
+        decrypted = await cipher.decryptFromSignal(message);
+      }
+      await _store!.persistSession(peerId);
+      return utf8.decode(decrypted);
+    } catch (e) {
+      // Session is broken (e.g. keys wiped by reinstall).
+      // Return a placeholder instead of raw ciphertext.
+      return '[Unable to decrypt — re-add contact to reset session]';
     }
-    await _store!.persistSession(peerId);
-    return utf8.decode(decrypted);
   }
 
   bool get isInitialized => _store != null;

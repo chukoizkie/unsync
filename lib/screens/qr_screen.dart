@@ -3,14 +3,7 @@ import 'package:flutter/services.dart';
 import 'package:qr_flutter/qr_flutter.dart';
 import 'package:mobile_scanner/mobile_scanner.dart';
 import 'dart:convert';
-
-const kBg = Color(0xFF0A0A0A);
-const kSurface = Color(0xFF111111);
-const kAccent = Color(0xFF00FF88);
-const kAccentDim = Color(0xFF00FF8820);
-const kText = Color(0xFFEEEEEE);
-const kMuted = Color(0xFF666666);
-const kBorder = Color(0xFF222222);
+import '../theme.dart';
 
 class QRScreen extends StatefulWidget {
   final String peerId;
@@ -174,7 +167,7 @@ class _QRScreenState extends State<QRScreen> with SingleTickerProviderStateMixin
         const Padding(
           padding: EdgeInsets.all(24),
           child: Text(
-            'Point camera at another Unsync user\'s QR code',
+            "Point camera at another Unsync user's QR code",
             style: TextStyle(color: kMuted, fontSize: 13),
             textAlign: TextAlign.center,
           ),

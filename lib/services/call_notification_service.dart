@@ -2,7 +2,7 @@ import 'package:flutter_local_notifications/flutter_local_notifications.dart';
 
 class CallNotificationService {
   static final _plugin = FlutterLocalNotificationsPlugin();
-  static const _channelId = 'unsync_incoming_call_v3';
+  static const _channelId = 'unsync_incoming_call_v5';
   static const _notifId = 42;
 
   static Function(String callerId)? onNotificationTapped;
@@ -28,6 +28,8 @@ class CallNotificationService {
       description: 'Incoming Unsync voice calls',
       importance: Importance.max,
       playSound: true,
+      sound: RawResourceAndroidNotificationSound('ringtone'),
+      audioAttributesUsage: AudioAttributesUsage.notificationRingtone,
       enableVibration: true,
     );
     final androidImpl = _plugin
@@ -48,6 +50,7 @@ class CallNotificationService {
       autoCancel: false,
       ongoing: true,
       playSound: true,
+      sound: RawResourceAndroidNotificationSound('ringtone'),
       visibility: NotificationVisibility.public,
     );
     await _plugin.show(

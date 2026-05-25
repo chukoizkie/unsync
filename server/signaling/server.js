@@ -101,8 +101,15 @@ wss.on('connection', (ws) => {
   ws.on('close', () => {
     if (myId) {
       peers.delete(myId);
-    // Keep fcmToken across disconnects so we can FCM-wake killed app
+      // Keep fcmToken across disconnects so we can FCM-wake killed app
       console.log(`Peer disconnected: ${myId}`);
+      // Notify any peer who was in a call with us that we disconnected.
+      // This prevents the caller getting stuck on "calling..." forever.
+      for (const [peerId, peerWs] of peers) {
+        if (peerWs.readyState === 1) {
+          peerWs.send(JSON.stringify({ type: 'call_end', from: myId }));
+        }
+      }
     }
   });
 });

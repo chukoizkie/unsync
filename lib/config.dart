@@ -1,5 +1,6 @@
 // Unsync configuration
 class UnsyncConfig {
-  static const String signalingUrl = 'ws://64.188.17.219:4000';
-  static const String relayUrl = 'ws://64.188.17.219:5000';
+  static const String signalingUrl = 'wss://signal.unsync.uk';
+  static const String relayUrl = 'wss://relay.unsync.uk';
 }
+

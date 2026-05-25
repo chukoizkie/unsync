@@ -4,6 +4,8 @@
   "description": "Unsync relay server for offline message delivery",
   "main": "relay.js",
   "dependencies": {
+    "better-sqlite3": "^12.10.0",
+    "firebase-admin": "^11.0.0",
     "ws": "^8.0.0"
   }
 }

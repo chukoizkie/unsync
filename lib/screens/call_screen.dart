@@ -1,10 +1,6 @@
 import 'package:flutter/material.dart';
 import 'dart:async';
-
-const kBg = Color(0xFF080808);
-const kAccent = Color(0xFF00FF87);
-const kMuted = Color(0xFF555555);
-const kText = Color(0xFFF0F0F0);
+import '../theme.dart';
 
 class CallScreen extends StatefulWidget {
   final String contactName;
@@ -45,9 +41,9 @@ class _CallScreenState extends State<CallScreen> {
   }
 
   String get _duration {
-    final m = (_seconds ~/ 60).toString().padLeft(2, "0");
-    final s = (_seconds % 60).toString().padLeft(2, "0");
-    return "$m:$s";
+    final m = (_seconds ~/ 60).toString().padLeft(2, '0');
+    final s = (_seconds % 60).toString().padLeft(2, '0');
+    return '$m:$s';
   }
 
   @override
@@ -92,8 +88,8 @@ class _CallScreenState extends State<CallScreen> {
                           decoration: BoxDecoration(
                             shape: BoxShape.circle,
                             color: widget.isMuted
-                              ? kAccent.withAlpha(40)
-                              : const Color(0xFF1A1A1A),
+                                ? kAccent.withAlpha(40)
+                                : const Color(0xFF1A1A1A),
                           ),
                           child: Icon(
                             widget.isMuted ? Icons.mic_off : Icons.mic,
@@ -101,7 +97,7 @@ class _CallScreenState extends State<CallScreen> {
                           ),
                         ),
                         const SizedBox(height: 8),
-                        Text(widget.isMuted ? "Unmute" : "Mute",
+                        Text(widget.isMuted ? 'Unmute' : 'Mute',
                           style: const TextStyle(color: kMuted, fontSize: 12)),
                       ],
                     ),
@@ -116,10 +112,12 @@ class _CallScreenState extends State<CallScreen> {
                             shape: BoxShape.circle,
                             color: Colors.redAccent,
                           ),
-                          child: const Icon(Icons.call_end, color: Colors.white, size: 32),
+                          child: const Icon(Icons.call_end,
+                            color: Colors.white, size: 32),
                         ),
                         const SizedBox(height: 8),
-                        const Text("End", style: TextStyle(color: kMuted, fontSize: 12)),
+                        const Text('End',
+                          style: TextStyle(color: kMuted, fontSize: 12)),
                       ],
                     ),
                   ),
@@ -134,7 +132,8 @@ class _CallScreenState extends State<CallScreen> {
                         child: const Icon(Icons.volume_up, color: kMuted),
                       ),
                       const SizedBox(height: 8),
-                      const Text("Speaker", style: TextStyle(color: kMuted, fontSize: 12)),
+                      const Text('Speaker',
+                        style: TextStyle(color: kMuted, fontSize: 12)),
                     ],
                   ),
                 ],

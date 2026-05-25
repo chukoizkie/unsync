@@ -1,10 +1,6 @@
-import '../services/ringtone_service.dart';
 import 'package:flutter/material.dart';
-
-const kBg = Color(0xFF080808);
-const kAccent = Color(0xFF00FF87);
-const kMuted = Color(0xFF555555);
-const kText = Color(0xFFF0F0F0);
+import '../theme.dart';
+import '../services/ringtone_service.dart';
 
 class IncomingCallScreen extends StatefulWidget {
   final String callerName;
@@ -59,7 +55,7 @@ class _IncomingCallScreenState extends State<IncomingCallScreen> {
                   style: const TextStyle(color: kText, fontSize: 28,
                     fontWeight: FontWeight.w700)),
                 const SizedBox(height: 8),
-                const Text("Incoming call...",
+                const Text('Incoming call...',
                   style: TextStyle(color: kMuted, fontSize: 14)),
               ],
             ),
@@ -68,7 +64,6 @@ class _IncomingCallScreenState extends State<IncomingCallScreen> {
               child: Row(
                 mainAxisAlignment: MainAxisAlignment.spaceEvenly,
                 children: [
-                  // Decline
                   GestureDetector(
                     onTap: widget.onDecline,
                     child: Column(
@@ -76,18 +71,16 @@ class _IncomingCallScreenState extends State<IncomingCallScreen> {
                         Container(
                           width: 72, height: 72,
                           decoration: const BoxDecoration(
-                            shape: BoxShape.circle,
-                            color: Colors.redAccent,
-                          ),
-                          child: const Icon(Icons.call_end, color: Colors.white, size: 32),
+                            shape: BoxShape.circle, color: Colors.redAccent),
+                          child: const Icon(Icons.call_end,
+                            color: Colors.white, size: 32),
                         ),
                         const SizedBox(height: 8),
-                        const Text("Decline",
+                        const Text('Decline',
                           style: TextStyle(color: kMuted, fontSize: 12)),
                       ],
                     ),
                   ),
-                  // Accept
                   GestureDetector(
                     onTap: widget.onAccept,
                     child: Column(
@@ -95,13 +88,12 @@ class _IncomingCallScreenState extends State<IncomingCallScreen> {
                         Container(
                           width: 72, height: 72,
                           decoration: const BoxDecoration(
-                            shape: BoxShape.circle,
-                            color: kAccent,
-                          ),
-                          child: const Icon(Icons.call, color: Colors.black, size: 32),
+                            shape: BoxShape.circle, color: kAccent),
+                          child: const Icon(Icons.call,
+                            color: Colors.black, size: 32),
                         ),
                         const SizedBox(height: 8),
-                        const Text("Accept",
+                        const Text('Accept',
                           style: TextStyle(color: kMuted, fontSize: 12)),
                       ],
                     ),
