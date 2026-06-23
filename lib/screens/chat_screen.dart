@@ -62,22 +62,41 @@ class _ChatScreenState extends State<ChatScreen> {
       _scrollToBottom(jump: true);
     });
 
-    widget.newMessageNotifier?.addListener(() {
-      if (widget.newMessageNotifier!.value.startsWith(widget.contact.id)) {
-        widget.messagesService?.getMessages(widget.contact.id).then((stored) {
-          if (mounted) {
-            setState(() {
-              _messages = stored.map((m) => Message(
-                text: m.text, isSent: m.isSent, time: m.time,
-              )).toList();
-            });
-            _scrollToBottom();
-          }
-        });
-      }
-    });
-
+    widget.newMessageNotifier?.addListener(_onNewMessage);
+    
     WidgetsBinding.instance.addPostFrameCallback((_) => _scrollToBottom(jump: true));
+  }
+
+  void _onNewMessage() {
+    if (widget.newMessageNotifier!.value.startsWith(widget.contact.id)) {
+      print(
+        'ChatScreen _onNewMessage fired notifier=${widget.newMessageNotifier!.value} contactId=${widget.contact.id}',
+      );
+      print('ChatScreen _onNewMessage startsWith passed');
+      widget.messagesService?.getMessages(widget.contact.id).then((stored) {
+        if (mounted) {
+          setState(() {
+            _messages = stored.map((m) => Message(
+              text: m.text, isSent: m.isSent, time: m.time,
+            )).toList();
+          });
+          _scrollToBottom();
+        }
+      });
+    } else {
+      print(
+        'ChatScreen _onNewMessage fired notifier=${widget.newMessageNotifier!.value} contactId=${widget.contact.id}',
+      );
+      print('ChatScreen _onNewMessage startsWith failed');
+    }
+  }
+
+  @override
+  void dispose() {
+    widget.newMessageNotifier?.removeListener(_onNewMessage);
+    _controller.dispose();
+    _scrollController.dispose();
+    super.dispose();
   }
 
   void _scrollToBottom({bool jump = false}) {

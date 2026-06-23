@@ -43,6 +43,7 @@ class _ContactsScreenState extends State<ContactsScreen> {
   final _newMessageNotifier  = ValueNotifier<String>('');
   final _connectionNotifier  = ValueNotifier<bool>(false);
   String? _pendingCallPeerId;
+  String? _openChatPeerId;
   bool _incomingCallRouteOpen = false;
 
   @override
@@ -119,6 +120,7 @@ class _ContactsScreenState extends State<ContactsScreen> {
 
       // ── notification tap handlers ──────────────────────────────────────────
       MessageNotificationService.onNotificationTapped = (peerId) async {
+        if (_openChatPeerId == peerId) return;
         await Future.delayed(const Duration(seconds: 2));
         await _contactsService.initialize();
         _realContacts = _contactsService.contacts.toList();
@@ -133,6 +135,7 @@ class _ContactsScreenState extends State<ContactsScreen> {
           initials: saved.displayName.substring(0, 1).toUpperCase(),
           lastMessage: '', time: '', online: true,
         );
+        _openChatPeerId = saved.peerId;
         Navigator.push(context, MaterialPageRoute(
           builder: (_) => ChatScreen(
             contact: contact,
@@ -156,7 +159,7 @@ class _ContactsScreenState extends State<ContactsScreen> {
               throw SignalSessionMissingException(contact.id);
             },
           ),
-        ));
+        )).whenComplete(() => _openChatPeerId = null);
       };
 
       CallNotificationService.onNotificationTapped = (callerId) {
@@ -197,8 +200,11 @@ class _ContactsScreenState extends State<ContactsScreen> {
             text = await _signalService.decrypt(from, payload);
           } catch (e) { print('Relay decrypt error: \$e'); }
         }
-        _messagesService.addMessage(from, text, false);
-        _newMessageNotifier.value = '\$from:\${DateTime.now().millisecondsSinceEpoch}';
+        await _messagesService.addMessage(from, text, false);
+        print(
+          'Relay queued message from=$from notifier=\$from:\${DateTime.now().millisecondsSinceEpoch}',
+        );
+        _newMessageNotifier.value = '${from}:${DateTime.now().millisecondsSinceEpoch}';
         MessageNotificationService.playMessageSound();
         final senderName = _realContacts.firstWhere(
           (c) => c.peerId == from,
@@ -304,9 +310,11 @@ class _ContactsScreenState extends State<ContactsScreen> {
         }
         _messagesService.addMessage(peerId, plaintext, false).then((_) {
           if (mounted) {
+            print(
+              'P2P message peerId=$peerId notifier=\$peerId:\${DateTime.now().millisecondsSinceEpoch}',
+            );
+            _newMessageNotifier.value = '${peerId}:${DateTime.now().millisecondsSinceEpoch}';
             setState(() {
-              _newMessageNotifier.value =
-                  '\$peerId:\${DateTime.now().millisecondsSinceEpoch}';
               MessageNotificationService.playMessageSound();
               final senderName = _realContacts.firstWhere(
                 (c) => c.peerId == peerId,
@@ -584,6 +592,7 @@ class _ContactsScreenState extends State<ContactsScreen> {
                       ));
                       return;
                     }
+                    _openChatPeerId = contact.id;
                     Navigator.push(context, MaterialPageRoute(
                       builder: (_) => ChatScreen(
                         contact: contact,
@@ -607,7 +616,7 @@ class _ContactsScreenState extends State<ContactsScreen> {
                           throw SignalSessionMissingException(contact.id);
                         },
                       ),
-                    ));
+                    )).whenComplete(() => _openChatPeerId = null);
                   },
                 );
               },
