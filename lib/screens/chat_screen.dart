@@ -21,6 +21,8 @@ class ChatScreen extends StatefulWidget {
   final MessagesService? messagesService;
   final ValueNotifier<String>? newMessageNotifier;
   final Future<String> Function(String)? onEncrypt;
+  final ValueNotifier<bool>? callAnsweredNotifier;
+  final ValueNotifier<dynamic>? remoteStreamNotifier;
 
   const ChatScreen({
     super.key,
@@ -36,6 +38,8 @@ class ChatScreen extends StatefulWidget {
     this.messagesService,
     this.newMessageNotifier,
     this.onEncrypt,
+    this.callAnsweredNotifier,
+    this.remoteStreamNotifier,
   });
 
   @override
@@ -272,6 +276,8 @@ class _ChatScreenState extends State<ChatScreen> {
                         widget.signaling?.endVoiceCall();
                         Navigator.pop(ctx);
                       },
+                      callAnsweredNotifier: widget.callAnsweredNotifier,
+                      remoteStreamNotifier: widget.remoteStreamNotifier,
                     ),
                   ),
                 ));

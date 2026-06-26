@@ -42,6 +42,8 @@ class _ContactsScreenState extends State<ContactsScreen> {
   List<SavedContact> _realContacts = [];
   final _newMessageNotifier  = ValueNotifier<String>('');
   final _connectionNotifier  = ValueNotifier<bool>(false);
+  final _callAnsweredNotifier = ValueNotifier<bool>(false);
+  final _remoteStreamNotifier = ValueNotifier<dynamic>(null);
   String? _pendingCallPeerId;
   String? _openChatPeerId;
   bool _incomingCallRouteOpen = false;
@@ -158,6 +160,8 @@ class _ContactsScreenState extends State<ContactsScreen> {
               }
               throw SignalSessionMissingException(contact.id);
             },
+            callAnsweredNotifier: _callAnsweredNotifier,
+            remoteStreamNotifier: _remoteStreamNotifier,
           ),
         )).whenComplete(() => _openChatPeerId = null);
       };
@@ -233,8 +237,18 @@ class _ContactsScreenState extends State<ContactsScreen> {
         _queueIncomingCallRoute(peerId);
       };
 
+      _signaling.onCallAnswered = () {
+        _callAnsweredNotifier.value = true;
+      };
+
+      _signaling.onRemoteStream = (stream) {
+        _remoteStreamNotifier.value = stream;
+      };
+
       _signaling.onCallEnded = () {
         try { CallNotificationService.cancel(); } catch (_) {}
+        _callAnsweredNotifier.value = false;
+        _remoteStreamNotifier.value = null;
         if (mounted) Navigator.of(context).popUntil((route) => route.isFirst);
       };
 
@@ -384,6 +398,8 @@ class _ContactsScreenState extends State<ContactsScreen> {
           _signaling.setMicMuted(isMuted);
         },
         onHangUp: () => _signaling.endVoiceCall(),
+        callAnsweredNotifier: _callAnsweredNotifier,
+        remoteStreamNotifier: _remoteStreamNotifier,
       ),
     );
   }
@@ -615,6 +631,8 @@ class _ContactsScreenState extends State<ContactsScreen> {
                           }
                           throw SignalSessionMissingException(contact.id);
                         },
+                        callAnsweredNotifier: _callAnsweredNotifier,
+                        remoteStreamNotifier: _remoteStreamNotifier,
                       ),
                     )).whenComplete(() => _openChatPeerId = null);
                   },

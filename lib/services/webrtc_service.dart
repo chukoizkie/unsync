@@ -58,6 +58,7 @@ class WebRTCService {
     };
 
     _peerConnection!.onTrack = (event) {
+      print('[CALL] remote track received');
       if (event.streams.isNotEmpty) {
         onRemoteStream?.call(event.streams[0]);
       }
@@ -154,6 +155,7 @@ class WebRTCService {
   // ── AUDIO ─────────────────────────────────────────────────────────────────
 
   Future<void> addAudioTrack() async {
+    print('[CALL] addAudioTrack');
     try {
       _localStream = await navigator.mediaDevices.getUserMedia({
         'audio': true,
@@ -210,6 +212,7 @@ class WebRTCService {
   // ── SIGNALING ─────────────────────────────────────────────────────────────
 
   Future<RTCSessionDescription> createOffer({bool withAudio = false}) async {
+    print('[CALL] createOffer');
     await ensureDataChannel();
     if (withAudio && !isAudioActive) await addAudioTrack();
     final offer = await _peerConnection!.createOffer();
@@ -219,6 +222,7 @@ class WebRTCService {
 
   Future<RTCSessionDescription> createAnswer(RTCSessionDescription offer,
       {bool withAudio = false}) async {
+    print('[CALL] createAnswer');
     await _peerConnection!.setRemoteDescription(offer);
     await _markRemoteDescriptionSetAndDrainIce();
     if (withAudio) await addAudioTrack();
@@ -266,7 +270,7 @@ class WebRTCService {
     _dataChannel?.send(RTCDataChannelMessage(message));
   }
 
-  void dispose() {
-    _disposeLocalPeerConnectionState();
+  Future<void> dispose() async {
+    await _disposeLocalPeerConnectionState();
   }
 }

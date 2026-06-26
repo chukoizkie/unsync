@@ -8,6 +8,8 @@ class CallScreen extends StatefulWidget {
   final VoidCallback onHangUp;
   final VoidCallback onMuteTap;
   final bool isMuted;
+  final ValueNotifier<bool>? callAnsweredNotifier;
+  final ValueNotifier<dynamic>? remoteStreamNotifier;
 
   const CallScreen({
     super.key,
@@ -16,6 +18,8 @@ class CallScreen extends StatefulWidget {
     required this.onHangUp,
     required this.onMuteTap,
     required this.isMuted,
+    this.callAnsweredNotifier,
+    this.remoteStreamNotifier,
   });
 
   @override
@@ -32,11 +36,38 @@ class _CallScreenState extends State<CallScreen> {
     _timer = Timer.periodic(const Duration(seconds: 1), (_) {
       if (mounted) setState(() => _seconds++);
     });
+    widget.callAnsweredNotifier?.addListener(_onCallAnswered);
+    widget.remoteStreamNotifier?.addListener(_onRemoteStream);
+
+    // The stream may already have been set by SignalingService before this
+    // screen mounted (e.g. createAnswer's onTrack firing inside acceptCall(),
+    // which is awaited before this screen is pushed). addListener only fires
+    // on future changes, so the current value must be checked explicitly.
+    final initialStream = widget.remoteStreamNotifier?.value;
+    print('[CALL] CallScreen initial remote stream: $initialStream');
+    if (initialStream != null) {
+      print('[CALL] CallScreen remote stream attached: $initialStream');
+    }
+  }
+
+  void _onCallAnswered() {
+    print('[CALL] active call screen received call-answered event');
+  }
+
+  void _onRemoteStream() {
+    final stream = widget.remoteStreamNotifier?.value;
+    if (stream == null) {
+      print('[CALL] CallScreen remote stream cleared');
+      return;
+    }
+    print('[CALL] CallScreen remote stream attached: $stream');
   }
 
   @override
   void dispose() {
     _timer?.cancel();
+    widget.callAnsweredNotifier?.removeListener(_onCallAnswered);
+    widget.remoteStreamNotifier?.removeListener(_onRemoteStream);
     super.dispose();
   }
 
