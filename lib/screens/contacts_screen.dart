@@ -232,7 +232,7 @@ class _ContactsScreenState extends State<ContactsScreen> {
         }
         await _messagesService.addMessage(from, text, false);
         print(
-          'Relay queued message from=$from notifier=\$from:\${DateTime.now().millisecondsSinceEpoch}',
+          'Relay queued message from=$from notifier=$from:${DateTime.now().millisecondsSinceEpoch}',
         );
         _newMessageNotifier.value = '${from}:${DateTime.now().millisecondsSinceEpoch}';
         MessageNotificationService.playMessageSound();
@@ -362,7 +362,7 @@ class _ContactsScreenState extends State<ContactsScreen> {
         _messagesService.addMessage(peerId, plaintext, false).then((_) {
           if (mounted) {
             print(
-              'P2P message peerId=$peerId notifier=\$peerId:\${DateTime.now().millisecondsSinceEpoch}',
+              'P2P message peerId=$peerId notifier=$peerId:${DateTime.now().millisecondsSinceEpoch}',
             );
             _newMessageNotifier.value = '${peerId}:${DateTime.now().millisecondsSinceEpoch}';
             setState(() {

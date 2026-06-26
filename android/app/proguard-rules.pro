@@ -1,10 +1,5 @@
-# Gson / flutter_local_notifications TypeToken fix
--keep class com.google.gson.** { *; }
+# Gson TypeToken generic type metadata used by flutter_local_notifications.
 -keepattributes Signature
 -keepattributes *Annotation*
--keep class * implements com.google.gson.TypeAdapterFactory
--keep class * implements com.google.gson.JsonSerializer
--keep class * implements com.google.gson.JsonDeserializer
--keepclassmembers,allowobfuscation class * {
-  @com.google.gson.annotations.SerializedName <fields>;
-}
+-keep class com.google.gson.reflect.TypeToken { *; }
+-keep class * extends com.google.gson.reflect.TypeToken

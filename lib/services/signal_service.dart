@@ -20,6 +20,9 @@ class SignalSessionMissingException implements Exception {
 class _PersistentSignalStore extends InMemorySignalProtocolStore {
   final FlutterSecureStorage _secureStorage;
   static const _sessionsKey = 'signal_sessions';
+  static const _preKeysKey = 'signal_pre_keys';
+  static const _signedPreKeysKey = 'signal_signed_pre_keys';
+  final Set<String> _sessionPeerIds = {};
 
   _PersistentSignalStore(
     super.keyPair,
@@ -29,6 +32,8 @@ class _PersistentSignalStore extends InMemorySignalProtocolStore {
 
   Future<void> init() async {
     await _loadSessions();
+    await _loadPreKeys();
+    await _loadSignedPreKeys();
   }
 
   Future<void> _loadSessions() async {
@@ -42,6 +47,35 @@ class _PersistentSignalStore extends InMemorySignalProtocolStore {
           base64Decode(entry.value as String),
         );
         await super.storeSession(address, sessionRecord);
+        _sessionPeerIds.add(entry.key);
+      }
+    } catch (_) {}
+  }
+
+  Future<void> _loadPreKeys() async {
+    final raw = await _secureStorage.read(key: _preKeysKey);
+    if (raw == null) return;
+    try {
+      final map = jsonDecode(raw) as Map<String, dynamic>;
+      for (final entry in map.entries) {
+        final record = PreKeyRecord.fromBuffer(
+          base64Decode(entry.value as String),
+        );
+        await super.storePreKey(record.id, record);
+      }
+    } catch (_) {}
+  }
+
+  Future<void> _loadSignedPreKeys() async {
+    final raw = await _secureStorage.read(key: _signedPreKeysKey);
+    if (raw == null) return;
+    try {
+      final map = jsonDecode(raw) as Map<String, dynamic>;
+      for (final entry in map.entries) {
+        final record = SignedPreKeyRecord.fromSerialized(
+          base64Decode(entry.value as String),
+        );
+        await super.storeSignedPreKey(record.id, record);
       }
     } catch (_) {}
   }
@@ -53,13 +87,48 @@ class _PersistentSignalStore extends InMemorySignalProtocolStore {
   ) async {
     await super.storeSession(address, record);
     await _writeSessionRecord(address.getName(), record);
+    _sessionPeerIds.add(address.getName());
+  }
+
+  @override
+  Future<void> storePreKey(int preKeyId, PreKeyRecord record) async {
+    await super.storePreKey(preKeyId, record);
+    await _writeRecord(_preKeysKey, preKeyId, record.serialize());
+  }
+
+  @override
+  Future<void> removePreKey(int preKeyId) async {
+    await super.removePreKey(preKeyId);
+    await _removeRecord(_preKeysKey, preKeyId);
+  }
+
+  @override
+  Future<void> storeSignedPreKey(
+    int signedPreKeyId,
+    SignedPreKeyRecord record,
+  ) async {
+    await super.storeSignedPreKey(signedPreKeyId, record);
+    await _writeRecord(
+      _signedPreKeysKey,
+      signedPreKeyId,
+      record.serialize(),
+    );
+  }
+
+  @override
+  Future<void> removeSignedPreKey(int signedPreKeyId) async {
+    await super.removeSignedPreKey(signedPreKeyId);
+    await _removeRecord(_signedPreKeysKey, signedPreKeyId);
   }
 
   Future<void> persistSession(String peerId) async {
     final address = SignalProtocolAddress(peerId, 1);
     final record = await super.loadSession(address);
     await _writeSessionRecord(peerId, record);
+    _sessionPeerIds.add(peerId);
   }
+
+  bool hasPersistedSession(String peerId) => _sessionPeerIds.contains(peerId);
 
   Future<void> _writeSessionRecord(String peerId, SessionRecord record) async {
     final raw = await _secureStorage.read(key: _sessionsKey);
@@ -73,11 +142,34 @@ class _PersistentSignalStore extends InMemorySignalProtocolStore {
       value: jsonEncode(existing),
     );
   }
+
+  Future<void> _writeRecord(String key, int id, Uint8List bytes) async {
+    final raw = await _secureStorage.read(key: key);
+    Map<String, dynamic> existing = {};
+    if (raw != null) {
+      try { existing = jsonDecode(raw) as Map<String, dynamic>; } catch (_) {}
+    }
+    existing[id.toString()] = base64Encode(bytes);
+    await _secureStorage.write(key: key, value: jsonEncode(existing));
+  }
+
+  Future<void> _removeRecord(String key, int id) async {
+    final raw = await _secureStorage.read(key: key);
+    if (raw == null) return;
+    try {
+      final existing = jsonDecode(raw) as Map<String, dynamic>;
+      existing.remove(id.toString());
+      await _secureStorage.write(key: key, value: jsonEncode(existing));
+    } catch (_) {}
+  }
 }
 
 class SignalService {
   static const _keyIdentityKeyPair = 'signal_identity_key_pair';
   static const _keyRegistrationId = 'signal_registration_id';
+  static const _keyNextPreKeyId = 'signal_next_pre_key_id';
+  static const _keyNextSignedPreKeyId = 'signal_next_signed_pre_key_id';
+  static const _keyActiveSignedPreKeyId = 'signal_active_signed_pre_key_id';
   final FlutterSecureStorage _secureStorage;
 
   IdentityKeyPair? _identityKeyPair;
@@ -120,13 +212,7 @@ class SignalService {
     );
     await _store!.init();
 
-    final preKeys = generatePreKeys(0, 5);
-    for (final preKey in preKeys) {
-      await _store!.storePreKey(preKey.id, preKey);
-    }
-
-    final signedPreKey = generateSignedPreKey(_identityKeyPair!, 0);
-    await _store!.storeSignedPreKey(signedPreKey.id, signedPreKey);
+    await _ensureSignedPreKey();
   }
 
   Map<String, dynamic> getPreKeyBundle() {
@@ -138,8 +224,8 @@ class SignalService {
   }
 
   Future<PreKeyBundle> buildPreKeyBundle() async {
-    final signedPreKey = await _store!.loadSignedPreKey(0);
-    final preKey = await _store!.loadPreKey(0);
+    final signedPreKey = await _ensureSignedPreKey();
+    final preKey = await _generateAndStoreNextPreKey();
     return PreKeyBundle(
       _registrationId!,
       1,
@@ -152,7 +238,46 @@ class SignalService {
     );
   }
 
-  bool hasSession(String peerId) => _sessions.containsKey(peerId);
+  Future<PreKeyRecord> _generateAndStoreNextPreKey() async {
+    final nextId = await _readInt(_keyNextPreKeyId, defaultValue: 1);
+    final preKey = generatePreKeys(nextId, 1).first;
+    await _store!.storePreKey(preKey.id, preKey);
+    await _secureStorage.write(
+      key: _keyNextPreKeyId,
+      value: (preKey.id + 1).toString(),
+    );
+    return preKey;
+  }
+
+  Future<SignedPreKeyRecord> _ensureSignedPreKey() async {
+    final activeIdRaw = await _secureStorage.read(key: _keyActiveSignedPreKeyId);
+    final activeId = int.tryParse(activeIdRaw ?? '');
+    if (activeId != null && await _store!.containsSignedPreKey(activeId)) {
+      return _store!.loadSignedPreKey(activeId);
+    }
+
+    final nextId = await _readInt(_keyNextSignedPreKeyId, defaultValue: 1);
+    final signedPreKey = generateSignedPreKey(_identityKeyPair!, nextId);
+    await _store!.storeSignedPreKey(signedPreKey.id, signedPreKey);
+    await _secureStorage.write(
+      key: _keyActiveSignedPreKeyId,
+      value: signedPreKey.id.toString(),
+    );
+    await _secureStorage.write(
+      key: _keyNextSignedPreKeyId,
+      value: (signedPreKey.id + 1).toString(),
+    );
+    return signedPreKey;
+  }
+
+  Future<int> _readInt(String key, {required int defaultValue}) async {
+    final raw = await _secureStorage.read(key: key);
+    return int.tryParse(raw ?? '') ?? defaultValue;
+  }
+
+  bool hasSession(String peerId) =>
+      _sessions.containsKey(peerId) ||
+      (_store?.hasPersistedSession(peerId) ?? false);
 
   Future<void> processPreKeyBundleFromMap(String peerId, Map<String, dynamic> map) async {
     final identityKey = IdentityKey(Curve.decodePoint(base64Decode(map['identityKey'] as String), 0));
