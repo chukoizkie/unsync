@@ -6,6 +6,7 @@ class Contact {
   final String time;
   final bool online;
   final int unread;
+  final String? photoPath;
 
   const Contact({
     required this.id,
@@ -15,5 +16,6 @@ class Contact {
     required this.time,
     required this.online,
     this.unread = 0,
+    this.photoPath,
   });
 }

@@ -1,3 +1,5 @@
+import 'dart:io';
+
 import 'package:flutter/material.dart';
 import '../theme.dart';
 import '../models/contact.dart';
@@ -201,6 +203,11 @@ class _ChatScreenState extends State<ChatScreen> {
 
   @override
   Widget build(BuildContext context) {
+    final photoFile = widget.contact.photoPath == null
+        ? null
+        : File(widget.contact.photoPath!);
+    final hasPhoto = photoFile != null && photoFile.existsSync();
+
     return Scaffold(
       backgroundColor: kBg,
       appBar: AppBar(
@@ -215,19 +222,26 @@ class _ChatScreenState extends State<ChatScreen> {
           children: [
             Stack(
               children: [
-                Container(
-                  width: 36, height: 36,
-                  decoration: BoxDecoration(
-                    color: kAccentDim,
-                    border: Border.all(color: kBorder),
-                    shape: BoxShape.circle,
+                if (hasPhoto)
+                  CircleAvatar(
+                    radius: 18,
+                    backgroundImage: FileImage(photoFile),
+                    backgroundColor: kAccentDim,
+                  )
+                else
+                  Container(
+                    width: 36, height: 36,
+                    decoration: BoxDecoration(
+                      color: kAccentDim,
+                      border: Border.all(color: kBorder),
+                      shape: BoxShape.circle,
+                    ),
+                    child: Center(
+                      child: Text(widget.contact.initials,
+                        style: const TextStyle(color: kAccent, fontSize: 14,
+                          fontWeight: FontWeight.w700)),
+                    ),
                   ),
-                  child: Center(
-                    child: Text(widget.contact.initials,
-                      style: const TextStyle(color: kAccent, fontSize: 14,
-                        fontWeight: FontWeight.w700)),
-                  ),
-                ),
                 if (widget.contact.online)
                   Positioned(
                     right: 0, bottom: 0,

@@ -1,4 +1,7 @@
 import 'dart:convert';
+import 'dart:io';
+import 'dart:typed_data';
+import 'package:path_provider/path_provider.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
 class SavedContact {
@@ -55,8 +58,32 @@ class ContactsService {
     await _save();
   }
 
+  Future<String?> getContactPhotoPath(String peerId) async {
+    final prefs = await SharedPreferences.getInstance();
+    final path = prefs.getString(_contactPhotoKey(peerId));
+    if (path == null || path.isEmpty) return null;
+    if (await File(path).exists()) return path;
+    await prefs.remove(_contactPhotoKey(peerId));
+    return null;
+  }
+
+  Future<void> saveContactPhotoPath(String peerId, String path) async {
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setString(_contactPhotoKey(peerId), path);
+  }
+
+  Future<String> saveContactPhoto(String peerId, Uint8List bytes) async {
+    final dir = await getApplicationDocumentsDirectory();
+    final file = File('${dir.path}/contact_photo_$peerId.jpg');
+    await file.writeAsBytes(bytes, flush: true);
+    await saveContactPhotoPath(peerId, file.path);
+    return file.path;
+  }
+
   Future<void> _save() async {
     final prefs = await SharedPreferences.getInstance();
     await prefs.setString(_keyContacts, jsonEncode(_contacts.map((c) => c.toJson()).toList()));
   }
+
+  String _contactPhotoKey(String peerId) => 'contact_photo_$peerId';
 }

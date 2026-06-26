@@ -1,4 +1,5 @@
 import 'dart:convert';
+import 'dart:io';
 import 'dart:typed_data';
 import 'package:flutter/material.dart';
 import 'package:firebase_messaging/firebase_messaging.dart';
@@ -17,6 +18,7 @@ import '../services/fcm_service.dart';
 import '../services/call_notification_service.dart';
 import '../services/message_notification_service.dart';
 import '../services/biometric_service.dart';
+import '../services/profile_photo_service.dart';
 import 'qr_screen.dart';
 import 'call_screen.dart';
 import 'incoming_call_screen.dart';
@@ -37,9 +39,12 @@ class _ContactsScreenState extends State<ContactsScreen> {
   final _messagesService = MessagesService();
   final _signalService   = SignalService();
   final _relayService    = RelayService();
+  final _profilePhotoService = ProfilePhotoService();
 
   bool _connected = false;
   List<SavedContact> _realContacts = [];
+  String? _profilePhotoPath;
+  Map<String, String> _contactPhotoPaths = {};
   final _newMessageNotifier  = ValueNotifier<String>('');
   final _connectionNotifier  = ValueNotifier<bool>(false);
   final _callAnsweredNotifier = ValueNotifier<bool>(false);
@@ -51,7 +56,29 @@ class _ContactsScreenState extends State<ContactsScreen> {
   @override
   void initState() {
     super.initState();
+    _loadProfilePhoto();
     _connect();
+  }
+
+  Future<void> _loadProfilePhoto() async {
+    final path = await _profilePhotoService.loadProfilePhotoPath();
+    if (mounted) setState(() => _profilePhotoPath = path);
+  }
+
+  Future<void> _reloadContacts() async {
+    await _contactsService.initialize();
+    final contacts = _contactsService.contacts.toList();
+    final photoPaths = <String, String>{};
+    for (final contact in contacts) {
+      final path = await _contactsService.getContactPhotoPath(contact.peerId);
+      if (path != null) photoPaths[contact.peerId] = path;
+    }
+    if (mounted) {
+      setState(() {
+        _realContacts = contacts;
+        _contactPhotoPaths = photoPaths;
+      });
+    }
   }
 
   void _queueIncomingCallRoute(String callerId) {
@@ -112,8 +139,7 @@ class _ContactsScreenState extends State<ContactsScreen> {
       ForegroundServiceManager.init();
       await _identity.initialize();
       await Future.microtask(() => _signalService.initialize());
-      await _contactsService.initialize();
-      if (mounted) setState(() => _realContacts = _contactsService.contacts.toList());
+      await _reloadContacts();
 
       final id = _identity.peerId ?? DateTime.now().millisecondsSinceEpoch.toString();
 
@@ -124,8 +150,7 @@ class _ContactsScreenState extends State<ContactsScreen> {
       MessageNotificationService.onNotificationTapped = (peerId) async {
         if (_openChatPeerId == peerId) return;
         await Future.delayed(const Duration(seconds: 2));
-        await _contactsService.initialize();
-        _realContacts = _contactsService.contacts.toList();
+        await _reloadContacts();
         final saved = _realContacts.firstWhere(
           (c) => c.peerId == peerId,
           orElse: () => SavedContact(peerId: peerId, displayName: peerId, addedAt: DateTime.now()),
@@ -136,6 +161,7 @@ class _ContactsScreenState extends State<ContactsScreen> {
           name: saved.displayName,
           initials: saved.displayName.substring(0, 1).toUpperCase(),
           lastMessage: '', time: '', online: true,
+          photoPath: _contactPhotoPaths[saved.peerId],
         );
         _openChatPeerId = saved.peerId;
         Navigator.push(context, MaterialPageRoute(
@@ -292,9 +318,20 @@ class _ContactsScreenState extends State<ContactsScreen> {
           if (parsed['type'] == 'handshake') {
             final name = parsed['name'] as String;
             final hid  = parsed['peerId'] as String;
-            _contactsService.addContact(hid, name).then((_) {
-              if (mounted) setState(() => _realContacts = _contactsService.contacts.toList());
-            });
+            await _contactsService.addContact(hid, name);
+            final photoBase64 = parsed['photoBase64'];
+            if (photoBase64 is String && photoBase64.isNotEmpty) {
+              if (photoBase64.length > 150 * 1024) {
+                print('Ignoring oversized profile photo');
+              } else {
+                try {
+                  await _contactsService.saveContactPhoto(hid, base64Decode(photoBase64));
+                } catch (e) {
+                  print('Failed to save profile photo: $e');
+                }
+              }
+            }
+            await _reloadContacts();
             if (parsed['signalBundle'] != null) {
               final b = parsed['signalBundle'];
               try {
@@ -353,7 +390,7 @@ class _ContactsScreenState extends State<ContactsScreen> {
         final myName = _identity.displayName ?? 'Unknown';
         final myId2  = _identity.peerId ?? '';
         final bundle = await _signalService.buildPreKeyBundle();
-        _signaling.sendMessage(peerId, jsonEncode({
+        final handshake = <String, dynamic>{
           'type': 'handshake',
           'name': myName,
           'peerId': myId2,
@@ -366,7 +403,15 @@ class _ContactsScreenState extends State<ContactsScreen> {
             'signedPreKey':        base64Encode(bundle.getSignedPreKey()!.serialize()),
             'signedPreKeySignature': base64Encode(bundle.getSignedPreKeySignature()!),
           }
-        }));
+        };
+        final profilePhotoPath = _profilePhotoPath;
+        if (profilePhotoPath != null) {
+          final file = File(profilePhotoPath);
+          if (await file.exists()) {
+            handshake['photoBase64'] = base64Encode(await file.readAsBytes());
+          }
+        }
+        _signaling.sendMessage(peerId, jsonEncode(handshake));
       };
 
       await _signaling.connect(id, fcmToken: fcmToken, handle: _identity.displayName);
@@ -411,7 +456,7 @@ class _ContactsScreenState extends State<ContactsScreen> {
         displayName: _identity.displayName ?? 'Unknown',
         onContactScanned: (peerId, name) async {
           await _contactsService.addContact(peerId, name);
-          if (mounted) setState(() => _realContacts = _contactsService.contacts.toList());
+          await _reloadContacts();
         },
       ),
     ));
@@ -423,7 +468,14 @@ class _ContactsScreenState extends State<ContactsScreen> {
       context: context,
       backgroundColor: kSurface,
       isScrollControlled: true,
-      builder: (_) => _SettingsSheet(controller: controller, identity: _identity),
+      builder: (_) => _SettingsSheet(
+        controller: controller,
+        identity: _identity,
+        profilePhotoPath: _profilePhotoPath,
+        onProfilePhotoChanged: (path) {
+          if (mounted) setState(() => _profilePhotoPath = path);
+        },
+      ),
     );
   }
 
@@ -454,7 +506,7 @@ class _ContactsScreenState extends State<ContactsScreen> {
               _signaling.disconnect();
               await Future.delayed(const Duration(milliseconds: 500));
               _connect();
-              if (mounted) setState(() => _realContacts = _contactsService.contacts.toList());
+              await _reloadContacts();
             },
           ),
           const SizedBox(height: 16),
@@ -596,6 +648,7 @@ class _ContactsScreenState extends State<ContactsScreen> {
                   initials: c.displayName.substring(0, 1).toUpperCase(),
                   lastMessage: _selectedTab == 0 ? 'Tap to chat' : 'Tap to call',
                   time: '', online: true,
+                  photoPath: _contactPhotoPaths[c.peerId],
                 );
                 return _ContactTile(
                   contact: contact,
@@ -685,6 +738,9 @@ class _ContactTile extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
+    final photoFile = contact.photoPath == null ? null : File(contact.photoPath!);
+    final hasPhoto = photoFile != null && photoFile.existsSync();
+
     return InkWell(
       onTap: onTap,
       onLongPress: onLongPress,
@@ -694,19 +750,26 @@ class _ContactTile extends StatelessWidget {
           children: [
             Stack(
               children: [
-                Container(
-                  width: 46, height: 46,
-                  decoration: BoxDecoration(
-                    color: kAccentDim,
-                    border: Border.all(color: kBorder),
-                    shape: BoxShape.circle,
+                if (hasPhoto)
+                  CircleAvatar(
+                    radius: 23,
+                    backgroundImage: FileImage(photoFile),
+                    backgroundColor: kAccentDim,
+                  )
+                else
+                  Container(
+                    width: 46, height: 46,
+                    decoration: BoxDecoration(
+                      color: kAccentDim,
+                      border: Border.all(color: kBorder),
+                      shape: BoxShape.circle,
+                    ),
+                    child: Center(
+                      child: Text(contact.initials,
+                        style: const TextStyle(color: kAccent, fontSize: 16,
+                          fontWeight: FontWeight.w700)),
+                    ),
                   ),
-                  child: Center(
-                    child: Text(contact.initials,
-                      style: const TextStyle(color: kAccent, fontSize: 16,
-                        fontWeight: FontWeight.w700)),
-                  ),
-                ),
                 if (contact.online)
                   Positioned(
                     right: 0, bottom: 0,
@@ -768,19 +831,29 @@ class _ContactTile extends StatelessWidget {
 class _SettingsSheet extends StatefulWidget {
   final TextEditingController controller;
   final dynamic identity;
-  const _SettingsSheet({required this.controller, required this.identity});
+  final String? profilePhotoPath;
+  final ValueChanged<String?> onProfilePhotoChanged;
+  const _SettingsSheet({
+    required this.controller,
+    required this.identity,
+    required this.profilePhotoPath,
+    required this.onProfilePhotoChanged,
+  });
 
   @override
   State<_SettingsSheet> createState() => _SettingsSheetState();
 }
 
 class _SettingsSheetState extends State<_SettingsSheet> {
+  final _profilePhotoService = ProfilePhotoService();
   bool _bioAvailable = false;
   bool _bioEnabled   = false;
+  String? _profilePhotoPath;
 
   @override
   void initState() {
     super.initState();
+    _profilePhotoPath = widget.profilePhotoPath;
     _loadBio();
   }
 
@@ -788,6 +861,60 @@ class _SettingsSheetState extends State<_SettingsSheet> {
     final avail   = await BiometricService.isAvailable();
     final enabled = await BiometricService.isEnabled();
     if (mounted) setState(() { _bioAvailable = avail; _bioEnabled = enabled; });
+  }
+
+  Future<void> _pickProfilePhoto() async {
+    final path = await _profilePhotoService.pickAndSaveProfilePhoto();
+    if (path == null) return;
+    if (!mounted) return;
+    setState(() => _profilePhotoPath = path);
+    widget.onProfilePhotoChanged(path);
+  }
+
+  Widget _buildProfilePhoto() {
+    final path = _profilePhotoPath;
+    final displayName = (widget.identity.displayName as String?) ?? '';
+    final initial = displayName.trim().isNotEmpty
+        ? displayName.trim().substring(0, 1).toUpperCase()
+        : '?';
+    final hasPhoto = path != null && File(path).existsSync();
+
+    return GestureDetector(
+      onTap: _pickProfilePhoto,
+      child: Column(
+        children: [
+          Container(
+            width: 72,
+            height: 72,
+            decoration: BoxDecoration(
+              color: kAccentDim,
+              border: Border.all(color: kBorder),
+              shape: BoxShape.circle,
+              image: hasPhoto
+                  ? DecorationImage(
+                      image: FileImage(File(path)),
+                      fit: BoxFit.cover,
+                    )
+                  : null,
+            ),
+            child: hasPhoto
+                ? null
+                : Center(
+                    child: Text(
+                      initial,
+                      style: const TextStyle(
+                        color: kAccent,
+                        fontSize: 26,
+                        fontWeight: FontWeight.w700,
+                      ),
+                    ),
+                  ),
+          ),
+          const SizedBox(height: 8),
+          const Text('Change photo', style: TextStyle(color: kAccent, fontSize: 12)),
+        ],
+      ),
+    );
   }
 
   @override
@@ -803,6 +930,8 @@ class _SettingsSheetState extends State<_SettingsSheet> {
         children: [
           const Text('Settings',
             style: TextStyle(color: kText, fontSize: 18, fontWeight: FontWeight.bold)),
+          const SizedBox(height: 16),
+          Center(child: _buildProfilePhoto()),
           const SizedBox(height: 16),
           const Text('Display name', style: TextStyle(color: kMuted, fontSize: 12)),
           const SizedBox(height: 8),
