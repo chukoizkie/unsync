@@ -34,6 +34,7 @@ class SignalingService {
   String? _callPeerId;
   RTCSessionDescription? _pendingCallOffer;
   String? _activeCallId;
+  bool _callAnswered = false;
 
   Timer? _pingTimer;
   Timer? _reconnectTimer;
@@ -153,6 +154,7 @@ class SignalingService {
         _callPeerId = null;
         _pendingCallOffer = null;
         _activeCallId = null;
+        _callAnswered = false;
         onCallEnded?.call();
         break;
       }
@@ -171,6 +173,7 @@ class SignalingService {
             RTCSessionDescription(msg['sdp']['sdp'], msg['sdp']['type']),
           );
         }
+        _callAnswered = true;
         onCallAnswered?.call();
         break;
       }
@@ -186,17 +189,30 @@ class SignalingService {
         await _closePeer(fromId);
         _callPeerId = null;
         _activeCallId = null;
+        _callAnswered = false;
         onCallEnded?.call();
         break;
       }
 
       case 'error':
-        print('Signaling error from server: ${msg['message']}');
+        final message = msg['message']?.toString() ?? 'Unknown error';
+        print('Signaling server error: $message');
+
+        final isPeerOffline =
+            message.toLowerCase().contains('peer not found') ||
+            message.toLowerCase().contains('offline');
+
         if (_callPeerId != null) {
+          if (!_callAnswered && isPeerOffline) {
+            print('[CALL] non-fatal error while ringing: $message');
+            break;
+          }
+
           await _closePeer(_callPeerId!);
           _callPeerId = null;
           _pendingCallOffer = null;
           _activeCallId = null;
+          _callAnswered = false;
           onCallEnded?.call();
         }
         break;
@@ -290,6 +306,7 @@ class SignalingService {
     print('[CALL] created callId=$callId');
     _callPeerId = peerId;
     _activeCallId = callId;
+    _callAnswered = false;
     _idleTimers[peerId]?.cancel();
     try {
       if (_peers.containsKey(peerId)) {
@@ -316,6 +333,7 @@ class SignalingService {
       await _closePeer(peerId);
       if (_callPeerId == peerId) _callPeerId = null;
       _activeCallId = null;
+      _callAnswered = false;
       onCallEnded?.call();
     }
   }
@@ -346,6 +364,7 @@ class SignalingService {
       if (_callPeerId == peerId) _callPeerId = null;
       _pendingCallOffer = null;
       _activeCallId = null;
+      _callAnswered = false;
       onCallEnded?.call();
     }
   }
@@ -356,6 +375,7 @@ class SignalingService {
     _callPeerId = null;
     _pendingCallOffer = null;
     _activeCallId = null;
+    _callAnswered = false;
   }
 
   void endVoiceCall() {
@@ -364,6 +384,7 @@ class SignalingService {
       _closePeer(_callPeerId!);
       _callPeerId = null;
       _activeCallId = null;
+      _callAnswered = false;
     }
     onCallEnded?.call();
   }
