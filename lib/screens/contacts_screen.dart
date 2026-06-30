@@ -541,6 +541,11 @@ class _ContactsScreenState extends State<ContactsScreen> {
   @override
   void dispose() {
     _signaling.dispose();
+    _relayService.dispose();
+    _newMessageNotifier.dispose();
+    _connectionNotifier.dispose();
+    _callAnsweredNotifier.dispose();
+    _remoteStreamNotifier.dispose();
     super.dispose();
   }
 
