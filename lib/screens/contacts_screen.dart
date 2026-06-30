@@ -51,6 +51,7 @@ class _ContactsScreenState extends State<ContactsScreen> {
   final _remoteStreamNotifier = ValueNotifier<dynamic>(null);
   String? _pendingCallPeerId;
   String? _openChatPeerId;
+  Route<void>? _activeCallRoute;
   bool _incomingCallRouteOpen = false;
 
   @override
@@ -119,12 +120,11 @@ class _ContactsScreenState extends State<ContactsScreen> {
             try { CallNotificationService.cancel(); } catch (_) {}
             await _signaling.acceptCall();
             if (context.mounted) {
+              final route = _createCallRoute(saved.displayName, false);
               Navigator.pushReplacement(
                 context,
-                MaterialPageRoute(
-                  builder: (_) => _buildCallScreen(saved.displayName, false),
-                ),
-              );
+                route,
+              ).whenComplete(() => _clearCallRoute(route));
             }
           },
         ),
@@ -275,7 +275,7 @@ class _ContactsScreenState extends State<ContactsScreen> {
         try { CallNotificationService.cancel(); } catch (_) {}
         _callAnsweredNotifier.value = false;
         _remoteStreamNotifier.value = null;
-        if (mounted) Navigator.of(context).popUntil((route) => route.isFirst);
+        _popActiveCallRoute();
       };
 
       // ── killed-state notification resume ───────────────────────────────────
@@ -447,6 +447,26 @@ class _ContactsScreenState extends State<ContactsScreen> {
         remoteStreamNotifier: _remoteStreamNotifier,
       ),
     );
+  }
+
+  MaterialPageRoute<void> _createCallRoute(String contactName, bool isOutgoing) {
+    final route = MaterialPageRoute<void>(
+      settings: const RouteSettings(name: 'call'),
+      builder: (_) => _buildCallScreen(contactName, isOutgoing),
+    );
+    _activeCallRoute = route;
+    return route;
+  }
+
+  void _clearCallRoute(Route<void> route) {
+    if (_activeCallRoute == route) _activeCallRoute = null;
+  }
+
+  void _popActiveCallRoute() {
+    final route = _activeCallRoute;
+    if (!mounted || route == null || !route.isCurrent) return;
+    Navigator.of(context).pop();
+    _activeCallRoute = null;
   }
 
   void _openQR(BuildContext context) {
@@ -656,9 +676,9 @@ class _ContactsScreenState extends State<ContactsScreen> {
                   onTap: () {
                     if (_selectedTab == 1) {
                       _signaling.startVoiceCall(contact.id, callerName: _identity.displayName ?? '');
-                      Navigator.push(context, MaterialPageRoute(
-                        builder: (_) => _buildCallScreen(contact.name, true),
-                      ));
+                      final route = _createCallRoute(contact.name, true);
+                      Navigator.push(context, route)
+                          .whenComplete(() => _clearCallRoute(route));
                       return;
                     }
                     _openChatPeerId = contact.id;
