@@ -399,10 +399,11 @@ class SignalingService {
     _callAnswered = false;
   }
 
-  void endVoiceCall() {
+  Future<void> endVoiceCall() async {
     if (_callPeerId != null) {
-      _send({'type': 'call_end', 'to': _callPeerId, 'callId': _activeCallId});
-      _closePeer(_callPeerId!);
+      final peerId = _callPeerId!;
+      _send({'type': 'call_end', 'to': peerId, 'callId': _activeCallId});
+      await _closePeer(peerId);
       _callPeerId = null;
       _activeCallId = null;
       _callAnswered = false;
