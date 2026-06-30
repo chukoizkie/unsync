@@ -14,6 +14,7 @@ class SignalingService {
 
   final Map<String, WebRTCService> _peers = {};
   final Map<String, Timer> _idleTimers = {};
+  final Map<String, List<RTCIceCandidate>> _pendingIceCandidates = {};
 
   Function(String peerId, String message)? onMessageReceived;
   Function(bool connected)? onConnectionStateChanged;
@@ -99,6 +100,7 @@ class SignalingService {
         final answer = await webrtc.createAnswer(
           RTCSessionDescription(msg['sdp']['sdp'], msg['sdp']['type']),
         );
+        await _flushPendingIceCandidates(fromId, webrtc);
         _send({'type': 'answer', 'to': fromId, 'sdp': answer.toMap()});
         onPeerConnected?.call(fromId);
         break;
@@ -120,8 +122,12 @@ class SignalingService {
           msg['candidate']['sdpMid'],
           msg['candidate']['sdpMLineIndex'],
         );
-        final webrtc = await _getOrCreatePeer(fromId, isInitiator: false);
-        await webrtc.addIceCandidate(candidate);
+        final webrtc = _peers[fromId];
+        if (webrtc != null) {
+          await webrtc.addIceCandidate(candidate);
+        } else {
+          (_pendingIceCandidates[fromId] ??= []).add(candidate);
+        }
         break;
 
       case 'peer_offline':
@@ -273,6 +279,17 @@ class SignalingService {
     return webrtc;
   }
 
+  Future<void> _flushPendingIceCandidates(
+    String peerId,
+    WebRTCService webrtc,
+  ) async {
+    final candidates = _pendingIceCandidates.remove(peerId);
+    if (candidates == null) return;
+    for (final candidate in candidates) {
+      await webrtc.addIceCandidate(candidate);
+    }
+  }
+
   void _resetIdleTimer(String peerId) {
     if (peerId == _callPeerId) return;
     _idleTimers[peerId]?.cancel();
@@ -354,6 +371,7 @@ class SignalingService {
       }
       final webrtc = await _getOrCreatePeer(peerId, isInitiator: false);
       final answer = await webrtc.createAnswer(_pendingCallOffer!, withAudio: true);
+      await _flushPendingIceCandidates(peerId, webrtc);
       print('[CALL] sending answer to $peerId callId=$_activeCallId');
       _send({'type': 'call_answer', 'to': peerId, 'sdp': answer.toMap(), 'callId': _activeCallId});
       _pendingCallOffer = null;
