@@ -174,11 +174,10 @@ class SignalingService {
         }
         print('[CALL] answer received from $fromId callId=$callId');
         final webrtc = _peers[fromId];
-        if (webrtc != null) {
-          await webrtc.setRemoteDescription(
-            RTCSessionDescription(msg['sdp']['sdp'], msg['sdp']['type']),
-          );
-        }
+        if (webrtc == null) break;
+        await webrtc.setRemoteDescription(
+          RTCSessionDescription(msg['sdp']['sdp'], msg['sdp']['type']),
+        );
         _callAnswered = true;
         onCallAnswered?.call();
         break;
