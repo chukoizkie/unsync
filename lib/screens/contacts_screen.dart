@@ -347,7 +347,7 @@ class _ContactsScreenState extends State<ContactsScreen> {
                   base64Decode(b['signedPreKeySignature'] as String),
                   signal.IdentityKey.fromBytes(base64Decode(b['identityKey'] as String), 0),
                 );
-                _signalService.processPreKeyBundle(hid, bundle);
+                await _signalService.processPreKeyBundle(hid, bundle);
               } catch (e) { print('Signal bundle error: \$e'); }
             }
             return;
