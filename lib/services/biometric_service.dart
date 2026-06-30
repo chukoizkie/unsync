@@ -24,7 +24,7 @@ class BiometricService {
   static Future<bool> authenticate() async {
     try {
       return await _auth.authenticate(
-        localizedReason: 'Authenticate to access Unsync',
+        localizedReason: 'Authenticate to access Mercury',
         biometricOnly: true,
         sensitiveTransaction: false,
       );

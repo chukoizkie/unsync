@@ -63,7 +63,7 @@ class _SplashScreenState extends State<SplashScreen> {
               decoration: const BoxDecoration(color: kAccent, shape: BoxShape.circle),
             ),
             const SizedBox(height: 16),
-            const Text('unsync',
+            const Text('Mercury',
               style: TextStyle(color: kText, fontSize: 28,
                 fontWeight: FontWeight.w700, letterSpacing: -1)),
             const SizedBox(height: 32),

@@ -572,7 +572,7 @@ class _ContactsScreenState extends State<ContactsScreen> {
             Column(
               crossAxisAlignment: CrossAxisAlignment.start,
               children: [
-                const Text('unsync',
+                const Text('Mercury',
                   style: TextStyle(color: kText, fontSize: 20,
                     fontWeight: FontWeight.w700, letterSpacing: -0.5)),
                 Text(

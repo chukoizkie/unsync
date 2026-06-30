@@ -45,7 +45,7 @@ class _SetupScreenState extends State<SetupScreen> {
                       color: kAccent, shape: BoxShape.circle),
                   ),
                   const SizedBox(width: 12),
-                  const Text('unsync',
+                  const Text('Mercury',
                     style: TextStyle(color: kText, fontSize: 32,
                       fontWeight: FontWeight.w700, letterSpacing: -1)),
                 ],

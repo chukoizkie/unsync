@@ -18,17 +18,17 @@ void main() async {
     systemNavigationBarColor: kBg,
     systemNavigationBarIconBrightness: Brightness.light,
   ));
-  runApp(const UnsyncApp());
+  runApp(const MercuryApp());
 }
 
-class UnsyncApp extends StatelessWidget {
-  const UnsyncApp({super.key});
+class MercuryApp extends StatelessWidget {
+  const MercuryApp({super.key});
 
   @override
   Widget build(BuildContext context) {
     return WithForegroundTask(
       child: MaterialApp(
-        title: 'Unsync',
+        title: 'Mercury',
         debugShowCheckedModeBanner: false,
         theme: ThemeData(
           brightness: Brightness.dark,

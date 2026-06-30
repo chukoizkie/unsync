@@ -158,7 +158,7 @@ class _QRScreenState extends State<QRScreen> with SingleTickerProviderStateMixin
                     SnackBar(content: Text('Connecting to $name...')),
                   );
                 } catch (e) {
-                  // not a valid unsync QR
+                  // not a valid Mercury QR
                 }
               },
             ),
@@ -167,7 +167,7 @@ class _QRScreenState extends State<QRScreen> with SingleTickerProviderStateMixin
         const Padding(
           padding: EdgeInsets.all(24),
           child: Text(
-            "Point camera at another Unsync user's QR code",
+            "Point camera at another Mercury user's QR code",
             style: TextStyle(color: kMuted, fontSize: 13),
             textAlign: TextAlign.center,
           ),

@@ -3,10 +3,10 @@ import 'package:flutter_foreground_task/flutter_foreground_task.dart';
 
 @pragma('vm:entry-point')
 void startCallback() {
-  FlutterForegroundTask.setTaskHandler(UnsyncTaskHandler());
+  FlutterForegroundTask.setTaskHandler(MercuryTaskHandler());
 }
 
-class UnsyncTaskHandler extends TaskHandler {
+class MercuryTaskHandler extends TaskHandler {
   @override
   Future<void> onStart(DateTime timestamp, TaskStarter starter) async {
     // Keep alive — actual WebSocket is managed in main isolate
@@ -16,7 +16,7 @@ class UnsyncTaskHandler extends TaskHandler {
   void onRepeatEvent(DateTime timestamp) {
     // Ping to keep the service alive every 25s
     FlutterForegroundTask.updateService(
-      notificationTitle: 'Unsync',
+      notificationTitle: 'Mercury',
       notificationText: 'Connected — end-to-end encrypted',
     );
   }
@@ -30,8 +30,8 @@ class ForegroundServiceManager {
     FlutterForegroundTask.init(
       androidNotificationOptions: AndroidNotificationOptions(
         channelId: 'unsync_foreground',
-        channelName: 'Unsync Messenger',
-        channelDescription: 'Keeps Unsync connected in the background',
+        channelName: 'Mercury',
+        channelDescription: 'Keeps Mercury connected in the background',
         channelImportance: NotificationChannelImportance.LOW,
         priority: NotificationPriority.LOW,
       ),
@@ -56,7 +56,7 @@ class ForegroundServiceManager {
     }
     await FlutterForegroundTask.startService(
       serviceId: 1000,
-      notificationTitle: 'Unsync',
+      notificationTitle: 'Mercury',
       notificationText: 'Connected — end-to-end encrypted',
       notificationIcon: null,
       notificationButtons: [],

@@ -42,7 +42,7 @@ class _BiometricScreenState extends State<BiometricScreen> {
         child: Column(
           mainAxisAlignment: MainAxisAlignment.center,
           children: [
-            const Text('unsync',
+            const Text('Mercury',
               style: TextStyle(color: kText, fontSize: 28,
                 fontWeight: FontWeight.w700, letterSpacing: -1)),
             const SizedBox(height: 8),

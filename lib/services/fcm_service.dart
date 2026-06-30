@@ -25,7 +25,7 @@ Future<void> firebaseMessagingBackgroundHandler(RemoteMessage message) async {
     FlutterForegroundTask.init(
       androidNotificationOptions: AndroidNotificationOptions(
         channelId: 'unsync_call_service_fg',
-        channelName: 'Unsync Call Service',
+        channelName: 'Mercury Call Service',
         channelImportance: NotificationChannelImportance.LOW,
       ),
       iosNotificationOptions: const IOSNotificationOptions(),
@@ -35,7 +35,7 @@ Future<void> firebaseMessagingBackgroundHandler(RemoteMessage message) async {
     );
     await FlutterForegroundTask.startService(
       serviceId: 256,
-      notificationTitle: 'Unsync',
+      notificationTitle: 'Mercury',
       notificationText: 'Incoming call from $callerName',
     );
 
@@ -51,7 +51,7 @@ Future<void> firebaseMessagingBackgroundHandler(RemoteMessage message) async {
     await prefs.setString('pending_message_wake', fromId);
     await MessageNotificationService.initialize();
     await MessageNotificationService.showMessageNotification(
-      'Unsync', 'You have a new message',
+      'Mercury', 'You have a new message',
       peerId: fromId.isNotEmpty ? fromId : null);
   }
 }

@@ -25,7 +25,7 @@ class CallNotificationService {
     const channel = AndroidNotificationChannel(
       _channelId,
       'Incoming Calls',
-      description: 'Incoming Unsync voice calls',
+      description: 'Incoming Mercury voice calls',
       importance: Importance.max,
       playSound: true,
       sound: RawResourceAndroidNotificationSound('ringtone'),
@@ -42,7 +42,7 @@ class CallNotificationService {
     const details = AndroidNotificationDetails(
       _channelId,
       'Incoming Calls',
-      channelDescription: 'Incoming Unsync voice calls',
+      channelDescription: 'Incoming Mercury voice calls',
       importance: Importance.max,
       priority: Priority.max,
       fullScreenIntent: true,

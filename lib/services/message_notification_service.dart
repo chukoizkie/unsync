@@ -21,7 +21,7 @@ class MessageNotificationService {
     const channel = AndroidNotificationChannel(
       _channelId,
       'Messages',
-      description: 'Incoming Unsync messages',
+      description: 'Incoming Mercury messages',
       importance: Importance.high,
       playSound: false,
     );
@@ -40,7 +40,7 @@ class MessageNotificationService {
     const details = AndroidNotificationDetails(
       _channelId,
       'Messages',
-      channelDescription: 'Incoming Unsync messages',
+      channelDescription: 'Incoming Mercury messages',
       importance: Importance.high,
       priority: Priority.high,
       playSound: false,
