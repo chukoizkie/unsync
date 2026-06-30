@@ -131,6 +131,9 @@ class _ContactsScreenState extends State<ContactsScreen> {
       ),
     ).whenComplete(() {
       _incomingCallRouteOpen = false;
+      if (_pendingCallPeerId != null) {
+        _drainPendingCallRoute();
+      }
     });
   }
 
