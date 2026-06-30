@@ -168,8 +168,11 @@ class SignalService {
   static const _keyIdentityKeyPair = 'signal_identity_key_pair';
   static const _keyRegistrationId = 'signal_registration_id';
   static const _keyNextPreKeyId = 'signal_next_pre_key_id';
+  static const _keyAvailablePreKeyIds = 'signal_available_pre_key_ids';
   static const _keyNextSignedPreKeyId = 'signal_next_signed_pre_key_id';
   static const _keyActiveSignedPreKeyId = 'signal_active_signed_pre_key_id';
+  static const _preKeyBatchSize = 10;
+  static const _preKeyReplenishThreshold = 3;
   final FlutterSecureStorage _secureStorage;
 
   IdentityKeyPair? _identityKeyPair;
@@ -225,7 +228,7 @@ class SignalService {
 
   Future<PreKeyBundle> buildPreKeyBundle() async {
     final signedPreKey = await _ensureSignedPreKey();
-    final preKey = await _generateAndStoreNextPreKey();
+    final preKey = await _popAvailablePreKey();
     return PreKeyBundle(
       _registrationId!,
       1,
@@ -238,15 +241,44 @@ class SignalService {
     );
   }
 
-  Future<PreKeyRecord> _generateAndStoreNextPreKey() async {
+  Future<PreKeyRecord> _popAvailablePreKey() async {
+    var ids = await _readAvailablePreKeyIds();
+    if (ids.isEmpty) {
+      await _generateAndStoreNextPreKeyBatch();
+      ids = await _readAvailablePreKeyIds();
+    }
+
+    while (ids.isNotEmpty) {
+      final preKeyId = ids.removeAt(0);
+      await _writeAvailablePreKeyIds(ids);
+      try {
+        final preKey = await _store!.loadPreKey(preKeyId);
+        if (ids.length < _preKeyReplenishThreshold) {
+          await _generateAndStoreNextPreKeyBatch();
+        }
+        return preKey;
+      } catch (_) {
+        ids = await _readAvailablePreKeyIds();
+      }
+    }
+
+    await _generateAndStoreNextPreKeyBatch();
+    return _popAvailablePreKey();
+  }
+
+  Future<void> _generateAndStoreNextPreKeyBatch() async {
     final nextId = await _readInt(_keyNextPreKeyId, defaultValue: 1);
-    final preKey = generatePreKeys(nextId, 1).first;
-    await _store!.storePreKey(preKey.id, preKey);
+    final preKeys = generatePreKeys(nextId, _preKeyBatchSize);
+    final ids = await _readAvailablePreKeyIds();
+    for (final preKey in preKeys) {
+      await _store!.storePreKey(preKey.id, preKey);
+      ids.add(preKey.id);
+    }
     await _secureStorage.write(
       key: _keyNextPreKeyId,
-      value: (preKey.id + 1).toString(),
+      value: (nextId + _preKeyBatchSize).toString(),
     );
-    return preKey;
+    await _writeAvailablePreKeyIds(ids);
   }
 
   Future<SignedPreKeyRecord> _ensureSignedPreKey() async {
@@ -273,6 +305,24 @@ class SignalService {
   Future<int> _readInt(String key, {required int defaultValue}) async {
     final raw = await _secureStorage.read(key: key);
     return int.tryParse(raw ?? '') ?? defaultValue;
+  }
+
+  Future<List<int>> _readAvailablePreKeyIds() async {
+    final raw = await _secureStorage.read(key: _keyAvailablePreKeyIds);
+    if (raw == null) return [];
+    try {
+      final list = jsonDecode(raw) as List<dynamic>;
+      return list.whereType<int>().toList();
+    } catch (_) {
+      return [];
+    }
+  }
+
+  Future<void> _writeAvailablePreKeyIds(List<int> ids) async {
+    await _secureStorage.write(
+      key: _keyAvailablePreKeyIds,
+      value: jsonEncode(ids),
+    );
   }
 
   bool hasSession(String peerId) =>
