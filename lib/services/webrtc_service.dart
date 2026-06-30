@@ -7,6 +7,7 @@ class WebRTCService {
   RTCDataChannel? _dataChannel;
   MediaStream? _localStream;
   bool _isRemoteDescriptionSet = false;
+  bool _audioActive = false;
   final List<RTCIceCandidate> _iceCandidateBuffer = [];
 
   // DHT identity — set by SignalingService before use
@@ -156,6 +157,7 @@ class WebRTCService {
 
   Future<void> addAudioTrack() async {
     print('[CALL] addAudioTrack');
+    if (_audioActive) return;
     try {
       _localStream = await navigator.mediaDevices.getUserMedia({
         'audio': true,
@@ -168,6 +170,7 @@ class WebRTCService {
       for (final track in audioTracks) {
         track.enabled = true;
       }
+      _audioActive = true;
     } catch (e) {
       print('Audio initialization failed: $e');
       await _disposeLocalPeerConnectionState();
@@ -196,6 +199,7 @@ class WebRTCService {
     await _peerConnection?.close();
     _peerConnection = null;
     _isRemoteDescriptionSet = false;
+    _audioActive = false;
     _iceCandidateBuffer.clear();
   }
 
