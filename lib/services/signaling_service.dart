@@ -157,6 +157,10 @@ class SignalingService {
           print('[CALL] ignoring stale call event callId=$callId active=$_activeCallId');
           break;
         }
+        final declinedPeerId = msg['from'] as String? ?? _callPeerId;
+        if (declinedPeerId != null) {
+          await _closePeer(declinedPeerId);
+        }
         _callPeerId = null;
         _pendingCallOffer = null;
         _activeCallId = null;
