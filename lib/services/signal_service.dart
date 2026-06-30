@@ -218,14 +218,6 @@ class SignalService {
     await _ensureSignedPreKey();
   }
 
-  Map<String, dynamic> getPreKeyBundle() {
-    final identityKey = _identityKeyPair!.getPublicKey();
-    return {
-      'registrationId': _registrationId,
-      'identityKey': base64Encode(identityKey.serialize()),
-    };
-  }
-
   Future<PreKeyBundle> buildPreKeyBundle() async {
     final signedPreKey = await _ensureSignedPreKey();
     final preKey = await _popAvailablePreKey();
