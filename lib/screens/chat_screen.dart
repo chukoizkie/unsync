@@ -25,6 +25,7 @@ class ChatScreen extends StatefulWidget {
   final Future<String> Function(String)? onEncrypt;
   final ValueNotifier<bool>? callAnsweredNotifier;
   final ValueNotifier<dynamic>? remoteStreamNotifier;
+  final Future<bool> Function(Contact contact)? onStartVoiceCall;
 
   const ChatScreen({
     super.key,
@@ -42,6 +43,7 @@ class ChatScreen extends StatefulWidget {
     this.onEncrypt,
     this.callAnsweredNotifier,
     this.remoteStreamNotifier,
+    this.onStartVoiceCall,
   });
 
   @override
@@ -272,8 +274,18 @@ class _ChatScreenState extends State<ChatScreen> {
           IconButton(
             icon: const Icon(Icons.call_outlined, color: kMuted),
             onPressed: () async {
-              await widget.signaling?.startVoiceCall(
-                widget.contact.id, callerName: widget.myName ?? '');
+              final startVoiceCall = widget.onStartVoiceCall;
+              if (startVoiceCall != null) {
+                await startVoiceCall(widget.contact);
+                return;
+              }
+
+              final started = await widget.signaling?.startVoiceCall(
+                    widget.contact.id,
+                    callerName: widget.myName ?? '',
+                  ) ??
+                  false;
+              if (!started) return;
               if (context.mounted) {
                 bool isMuted = false;
                 Navigator.push(context, MaterialPageRoute(

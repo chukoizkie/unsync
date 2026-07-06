@@ -1,11 +1,13 @@
+import 'dart:async';
+
 import 'package:flutter/material.dart';
 import '../theme.dart';
 import '../services/ringtone_service.dart';
 
 class IncomingCallScreen extends StatefulWidget {
   final String callerName;
-  final VoidCallback onAccept;
-  final VoidCallback onDecline;
+  final Future<void> Function() onAccept;
+  final Future<void> Function() onDecline;
 
   const IncomingCallScreen({
     super.key,
@@ -19,15 +21,31 @@ class IncomingCallScreen extends StatefulWidget {
 }
 
 class _IncomingCallScreenState extends State<IncomingCallScreen> {
+  bool _handlingAction = false;
+
   @override
   void initState() {
     super.initState();
-    RingtoneService.startRinging();
+    unawaited(RingtoneService.startRinging().catchError((_) {}));
+  }
+
+  Future<void> _handleAccept() async {
+    if (_handlingAction) return;
+    _handlingAction = true;
+    await RingtoneService.stopRinging();
+    await widget.onAccept();
+  }
+
+  Future<void> _handleDecline() async {
+    if (_handlingAction) return;
+    _handlingAction = true;
+    await RingtoneService.stopRinging();
+    await widget.onDecline();
   }
 
   @override
   void dispose() {
-    RingtoneService.stopRinging();
+    unawaited(RingtoneService.stopRinging().catchError((_) {}));
     super.dispose();
   }
 
@@ -65,7 +83,7 @@ class _IncomingCallScreenState extends State<IncomingCallScreen> {
                 mainAxisAlignment: MainAxisAlignment.spaceEvenly,
                 children: [
                   GestureDetector(
-                    onTap: widget.onDecline,
+                    onTap: _handleDecline,
                     child: Column(
                       children: [
                         Container(
@@ -82,7 +100,7 @@ class _IncomingCallScreenState extends State<IncomingCallScreen> {
                     ),
                   ),
                   GestureDetector(
-                    onTap: widget.onAccept,
+                    onTap: _handleAccept,
                     child: Column(
                       children: [
                         Container(

@@ -1,6 +1,7 @@
 import 'dart:async';
 import 'dart:convert';
 import '../config.dart';
+import '../models/call_session.dart';
 import 'package:flutter_webrtc/flutter_webrtc.dart';
 import 'package:web_socket_channel/web_socket_channel.dart';
 import 'package:web_socket_channel/io.dart';
@@ -15,6 +16,7 @@ class SignalingService {
   final Map<String, WebRTCService> _peers = {};
   final Map<String, Timer> _idleTimers = {};
   final Map<String, List<RTCIceCandidate>> _pendingIceCandidates = {};
+  final Map<String, List<RTCIceCandidate>> _pendingCallIceCandidates = {};
 
   Function(String peerId, String message)? onMessageReceived;
   Function(bool connected)? onConnectionStateChanged;
@@ -32,13 +34,23 @@ class SignalingService {
   // DHT identity — set before connecting
   String? _myHandle;
 
-  String? _callPeerId;
-  RTCSessionDescription? _pendingCallOffer;
-  String? _activeCallId;
-  bool _callAnswered = false;
+  CallSession? _activeCall;
+  bool _registered = false;
+
+  bool get isConnected => _registered;
+  String? get activeCallId => _activeCall?.callId;
+
+  bool hasPendingIncomingCallFrom(String peerId) {
+    final session = _activeCall;
+    return session != null &&
+        session.peerId == peerId &&
+        session.isIncoming &&
+        session.hasPendingOffer;
+  }
 
   Timer? _pingTimer;
   Timer? _reconnectTimer;
+  Future<void>? _activeCallCleanup;
 
   Future<void> connect(String myId, {String? fcmToken, String? handle}) async {
     _fcmToken = fcmToken;
@@ -51,10 +63,12 @@ class SignalingService {
       _handleMessage(msg);
     }, onError: (e) {
       print('Signaling error: $e');
+      _registered = false;
       onConnectionStateChanged?.call(false);
       _scheduleReconnect();
     }, onDone: () {
       print('Signaling disconnected');
+      _registered = false;
       onConnectionStateChanged?.call(false);
       _scheduleReconnect();
     });
@@ -82,6 +96,7 @@ class SignalingService {
     switch (msg['type']) {
       case 'registered':
         print('Registered as: ${msg['id']}');
+        _registered = true;
         _reconnectAttempt = 0;
         onConnectionStateChanged?.call(true);
         _pingTimer?.cancel();
@@ -117,16 +132,35 @@ class SignalingService {
 
       case 'ice':
         final fromId = msg['from'] as String;
+        final callId = msg['callId'] as String?;
         final candidate = RTCIceCandidate(
           msg['candidate']['candidate'],
           msg['candidate']['sdpMid'],
           msg['candidate']['sdpMLineIndex'],
         );
+        final session = _activeCall;
+        if (callId != null) {
+          if (session == null) {
+            _rejectStaleCallEvent('ice', callId);
+            break;
+          }
+          if (session.callId != callId || session.peerId != fromId) {
+            _rejectStaleCallEvent('ice', callId);
+            break;
+          }
+        } else if (session != null && session.peerId == fromId) {
+          _rejectStaleCallEvent('ice', null);
+          break;
+        }
         final webrtc = _peers[fromId];
         if (webrtc != null) {
           await webrtc.addIceCandidate(candidate);
         } else {
-          (_pendingIceCandidates[fromId] ??= []).add(candidate);
+          if (callId != null) {
+            (_pendingCallIceCandidates[callId] ??= []).add(candidate);
+          } else {
+            (_pendingIceCandidates[fromId] ??= []).add(candidate);
+          }
         }
         break;
 
@@ -140,40 +174,46 @@ class SignalingService {
       case 'call_offer':
         final fromId = msg['from'] as String;
         final callId = msg['callId'] as String?;
+        if (callId == null) {
+          _rejectStaleCallEvent('call_offer', null);
+          break;
+        }
+        if (_activeCall != null && _activeCall!.callId != callId) {
+          _rejectStaleCallEvent('call_offer', callId);
+          break;
+        }
         print('[CALL] offer received from $fromId callId=$callId');
         final offer = RTCSessionDescription(
           msg['sdp']['sdp'],
           msg['sdp']['type'],
         );
-        _activeCallId = callId;
-        _callPeerId = fromId;
-        _pendingCallOffer = offer;
+        _pendingCallIceCandidates.removeWhere((id, _) => id != callId);
+        _activeCall = CallSession(
+          callId: callId,
+          peerId: fromId,
+          direction: CallSessionDirection.incoming,
+          state: CallSessionState.incomingRinging,
+          pendingOffer: offer,
+        );
+        print(
+          '[CALL] signaling call_offer created session callId=$callId peer=$fromId',
+        );
         onIncomingCall?.call(fromId);
         break;
 
       case 'call_declined': {
         final callId = msg['callId'] as String?;
-        if (callId != null && _activeCallId != null && callId != _activeCallId) {
-          print('[CALL] ignoring stale call event callId=$callId active=$_activeCallId');
+        if (!_isActiveCallEvent(callId, 'call_declined')) {
           break;
         }
-        final declinedPeerId = msg['from'] as String? ?? _callPeerId;
-        if (declinedPeerId != null) {
-          await _closePeer(declinedPeerId);
-        }
-        _callPeerId = null;
-        _pendingCallOffer = null;
-        _activeCallId = null;
-        _callAnswered = false;
-        onCallEnded?.call();
+        await _cleanupActiveCall(reason: 'call_declined');
         break;
       }
 
       case 'call_answer': {
         final fromId = msg['from'] as String;
         final callId = msg['callId'] as String?;
-        if (callId != null && callId != _activeCallId) {
-          print('[CALL] ignoring stale call event callId=$callId active=$_activeCallId');
+        if (!_isActiveCallEvent(callId, 'call_answer')) {
           break;
         }
         print('[CALL] answer received from $fromId callId=$callId');
@@ -182,7 +222,8 @@ class SignalingService {
         await webrtc.setRemoteDescription(
           RTCSessionDescription(msg['sdp']['sdp'], msg['sdp']['type']),
         );
-        _callAnswered = true;
+        await _flushPendingCallIceCandidates(callId!, webrtc);
+        _activeCall?.state = CallSessionState.active;
         onCallAnswered?.call();
         break;
       }
@@ -190,16 +231,11 @@ class SignalingService {
       case 'call_end': {
         final fromId = msg['from'] as String;
         final callId = msg['callId'] as String?;
-        if (callId != null && _activeCallId != null && callId != _activeCallId) {
-          print('[CALL] ignoring stale call event callId=$callId active=$_activeCallId');
+        if (!_isActiveCallEvent(callId, 'call_end')) {
           break;
         }
         print('[CALL] call ended by $fromId callId=$callId');
-        await _closePeer(fromId);
-        _callPeerId = null;
-        _activeCallId = null;
-        _callAnswered = false;
-        onCallEnded?.call();
+        await _cleanupActiveCall(reason: 'call_end');
         break;
       }
 
@@ -211,18 +247,14 @@ class SignalingService {
             message.toLowerCase().contains('peer not found') ||
             message.toLowerCase().contains('offline');
 
-        if (_callPeerId != null) {
-          if (!_callAnswered && isPeerOffline) {
+        final session = _activeCall;
+        if (session != null) {
+          if (!session.isAnswered && isPeerOffline) {
             print('[CALL] non-fatal error while ringing: $message');
             break;
           }
 
-          await _closePeer(_callPeerId!);
-          _callPeerId = null;
-          _pendingCallOffer = null;
-          _activeCallId = null;
-          _callAnswered = false;
-          onCallEnded?.call();
+          await _cleanupActiveCall(reason: 'signaling_error');
         }
         break;
     }
@@ -269,7 +301,16 @@ class SignalingService {
     };
 
     webrtc.onIceCandidate((candidate) {
-      _send({'type': 'ice', 'to': peerId, 'candidate': candidate.toMap()});
+      final payload = <String, dynamic>{
+        'type': 'ice',
+        'to': peerId,
+        'candidate': candidate.toMap(),
+      };
+      final session = _activeCall;
+      if (session != null && session.peerId == peerId) {
+        payload['callId'] = session.callId;
+      }
+      _send(payload);
     });
 
     if (isInitiator && sendInitialOffer) {
@@ -293,8 +334,19 @@ class SignalingService {
     }
   }
 
+  Future<void> _flushPendingCallIceCandidates(
+    String callId,
+    WebRTCService webrtc,
+  ) async {
+    final candidates = _pendingCallIceCandidates.remove(callId);
+    if (candidates == null) return;
+    for (final candidate in candidates) {
+      await webrtc.addIceCandidate(candidate);
+    }
+  }
+
   void _resetIdleTimer(String peerId) {
-    if (peerId == _callPeerId) return;
+    if (peerId == _activeCall?.peerId) return;
     _idleTimers[peerId]?.cancel();
     _idleTimers[peerId] = Timer(
       const Duration(seconds: _idleTimeoutSeconds),
@@ -305,7 +357,8 @@ class SignalingService {
   Future<void> _closePeer(String peerId) async {
     _idleTimers.remove(peerId)?.cancel();
     final peer = _peers.remove(peerId);
-    if (peer != null) await peer.dispose();
+    if (peer == null) return;
+    await peer.dispose();
     print('P2P connection closed: $peerId');
   }
 
@@ -319,19 +372,33 @@ class SignalingService {
     _resetIdleTimer(peerId);
   }
 
-  Future<void> startVoiceCall(String peerId, {String? callerName}) async {
+  Future<bool> startVoiceCall(String peerId, {String? callerName}) async {
+    if (!_registered) {
+      print('[CALL] startVoiceCall blocked because signaling is disconnected');
+      return false;
+    }
+    if (_activeCall != null) {
+      print(
+        '[CALL] startVoiceCall closing active session before new call callId=${_activeCall!.callId}',
+      );
+      await _cleanupActiveCall(reason: 'new_call');
+    }
+    if (_peers.containsKey(peerId)) {
+      await _closePeer(peerId);
+    }
+    _pendingCallIceCandidates.clear();
     print('[CALL] startVoiceCall peer=$peerId');
     final now = DateTime.now().millisecondsSinceEpoch;
     final callId = '${_myId}_${peerId}_$now';
     print('[CALL] created callId=$callId');
-    _callPeerId = peerId;
-    _activeCallId = callId;
-    _callAnswered = false;
+    _activeCall = CallSession(
+      callId: callId,
+      peerId: peerId,
+      direction: CallSessionDirection.outgoing,
+      state: CallSessionState.outgoingPreparing,
+    );
     _idleTimers[peerId]?.cancel();
     try {
-      if (_peers.containsKey(peerId)) {
-        await _closePeer(peerId);
-      }
       final webrtc = await _getOrCreatePeer(peerId, sendInitialOffer: false);
       await webrtc.ensureDataChannel();
       if (!webrtc.isAudioActive) {
@@ -347,68 +414,133 @@ class SignalingService {
         'callerName': callerName ?? _myId ?? '',
         'callId': callId,
       });
+      _activeCall?.state = CallSessionState.outgoingRinging;
+      return true;
     } catch (e) {
       print('Voice call setup failed for $peerId: $e');
-      _send({'type': 'call_declined', 'to': peerId, 'callId': _activeCallId});
-      await _closePeer(peerId);
-      if (_callPeerId == peerId) _callPeerId = null;
-      _activeCallId = null;
-      _callAnswered = false;
-      onCallEnded?.call();
+      _send({
+        'type': 'call_declined',
+        'to': peerId,
+        'callId': _activeCall?.callId,
+      });
+      await _cleanupActiveCall(reason: 'start_failed');
+      return false;
     }
   }
 
   void setMicMuted(bool muted) {
-    if (_callPeerId != null) {
-      _peers[_callPeerId]?.setMicMuted(muted);
+    final peerId = _activeCall?.peerId;
+    if (peerId != null) {
+      _peers[peerId]?.setMicMuted(muted);
     }
   }
 
-  Future<void> acceptCall() async {
-    if (_callPeerId == null || _pendingCallOffer == null) return;
-    final peerId = _callPeerId!;
+  Future<bool> acceptCall() async {
+    final session = _activeCall;
+    if (session == null || !session.isIncoming || session.pendingOffer == null) {
+      print('[CALL] accept blocked because no SDP offer');
+      return false;
+    }
+    final peerId = session.peerId;
     print('[CALL] acceptCall peer=$peerId');
     try {
       if (_peers.containsKey(peerId)) {
         await _closePeer(peerId);
       }
+      session.state = CallSessionState.connecting;
       final webrtc = await _getOrCreatePeer(peerId, isInitiator: false);
-      final answer = await webrtc.createAnswer(_pendingCallOffer!, withAudio: true);
-      await _flushPendingIceCandidates(peerId, webrtc);
-      print('[CALL] sending answer to $peerId callId=$_activeCallId');
-      _send({'type': 'call_answer', 'to': peerId, 'sdp': answer.toMap(), 'callId': _activeCallId});
-      _pendingCallOffer = null;
+      final answer = await webrtc.createAnswer(
+        session.pendingOffer!,
+        withAudio: true,
+      );
+      await _flushPendingCallIceCandidates(session.callId, webrtc);
+      print('[CALL] sending answer to $peerId callId=${session.callId}');
+      _send({
+        'type': 'call_answer',
+        'to': peerId,
+        'sdp': answer.toMap(),
+        'callId': session.callId,
+      });
+      session.pendingOffer = null;
+      session.state = CallSessionState.active;
+      return true;
     } catch (e) {
       print('Accept call failed for $peerId: $e');
-      _send({'type': 'call_declined', 'to': peerId, 'callId': _activeCallId});
-      await _closePeer(peerId);
-      if (_callPeerId == peerId) _callPeerId = null;
-      _pendingCallOffer = null;
-      _activeCallId = null;
-      _callAnswered = false;
-      onCallEnded?.call();
+      _send({'type': 'call_declined', 'to': peerId, 'callId': session.callId});
+      await _cleanupActiveCall(reason: 'accept_failed');
+      return false;
     }
   }
 
   void declineCall() {
-    if (_callPeerId == null) return;
-    _send({'type': 'call_declined', 'to': _callPeerId, 'callId': _activeCallId});
-    _callPeerId = null;
-    _pendingCallOffer = null;
-    _activeCallId = null;
-    _callAnswered = false;
+    final session = _activeCall;
+    if (session == null) return;
+    _send({
+      'type': 'call_declined',
+      'to': session.peerId,
+      'callId': session.callId,
+    });
+    unawaited(_cleanupActiveCall(reason: 'decline'));
   }
 
   Future<void> endVoiceCall() async {
-    if (_callPeerId != null) {
-      final peerId = _callPeerId!;
-      _send({'type': 'call_end', 'to': peerId, 'callId': _activeCallId});
-      await _closePeer(peerId);
-      _callPeerId = null;
-      _activeCallId = null;
-      _callAnswered = false;
+    final session = _activeCall;
+    if (session != null) {
+      _send({
+        'type': 'call_end',
+        'to': session.peerId,
+        'callId': session.callId,
+      });
+      await _cleanupActiveCall(reason: 'local_end');
+      return;
     }
     onCallEnded?.call();
+  }
+
+  bool _isActiveCallEvent(String? callId, String type) {
+    final session = _activeCall;
+    if (callId == null || session == null || session.callId != callId) {
+      _rejectStaleCallEvent(type, callId);
+      return false;
+    }
+    return true;
+  }
+
+  void _rejectStaleCallEvent(String type, String? callId) {
+    print(
+      '[CALL] stale call event rejected type=$type callId=${callId ?? 'missing'} active=${_activeCall?.callId ?? 'none'}',
+    );
+  }
+
+  Future<void> _cleanupActiveCall({required String reason}) async {
+    final existingCleanup = _activeCallCleanup;
+    if (existingCleanup != null) {
+      print('[CALL] centralized cleanup already running reason=$reason');
+      return existingCleanup;
+    }
+
+    final session = _activeCall;
+    print(
+      '[CALL] centralized cleanup reason=$reason callId=${session?.callId ?? 'none'}',
+    );
+    if (session == null) {
+      return;
+    }
+
+    session.state = CallSessionState.ending;
+    _activeCall = null;
+    session.pendingOffer = null;
+    _pendingCallIceCandidates.remove(session.callId);
+    onCallEnded?.call();
+
+    _activeCallCleanup = () async {
+      try {
+        await _closePeer(session.peerId);
+      } finally {
+        _activeCallCleanup = null;
+      }
+    }();
+    await _activeCallCleanup;
   }
 
   bool isPeerConnected(String peerId) =>
@@ -417,15 +549,18 @@ class SignalingService {
   void disconnect() {
     _pingTimer?.cancel();
     _reconnectTimer?.cancel();
-    for (final p in _peers.values) {
-      p.dispose();
+    unawaited(_cleanupActiveCall(reason: 'disconnect'));
+    for (final peerId in List<String>.from(_peers.keys)) {
+      unawaited(_closePeer(peerId));
     }
-    _peers.clear();
     for (var t in _idleTimers.values) {
       t.cancel();
     }
     _idleTimers.clear();
+    _pendingIceCandidates.clear();
+    _pendingCallIceCandidates.clear();
     _channel?.sink.close();
+    _registered = false;
     _myId = null;
   }
 

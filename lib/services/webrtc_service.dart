@@ -8,6 +8,7 @@ class WebRTCService {
   MediaStream? _localStream;
   bool _isRemoteDescriptionSet = false;
   bool _audioActive = false;
+  Future<void>? _disposeFuture;
   final List<RTCIceCandidate> _iceCandidateBuffer = [];
 
   // DHT identity — set by SignalingService before use
@@ -41,6 +42,9 @@ class WebRTCService {
   };
 
   Future<void> initialize() async {
+    _disposeFuture = null;
+    _isRemoteDescriptionSet = false;
+    _iceCandidateBuffer.clear();
     _peerConnection = await createPeerConnection(_iceServers, _config);
 
     _peerConnection!.onIceConnectionState = (state) {
@@ -142,14 +146,22 @@ class WebRTCService {
   }
 
   Future<RTCDataChannel> createDataChannel() async {
+    final peerConnection = _peerConnection;
+    if (peerConnection == null) {
+      throw StateError('Cannot create data channel after peer disposal');
+    }
     final init = RTCDataChannelInit()..ordered = true;
-    _dataChannel = await _peerConnection!.createDataChannel('messages', init);
+    _dataChannel = await peerConnection.createDataChannel('messages', init);
     _setupDataChannel(_dataChannel!);
     return _dataChannel!;
   }
 
   Future<RTCDataChannel> ensureDataChannel() async {
-    if (_dataChannel != null) return _dataChannel!;
+    final channel = _dataChannel;
+    if (channel != null &&
+        channel.state != RTCDataChannelState.RTCDataChannelClosed) {
+      return channel;
+    }
     return createDataChannel();
   }
 
@@ -158,6 +170,10 @@ class WebRTCService {
   Future<void> addAudioTrack() async {
     print('[CALL] addAudioTrack');
     if (_audioActive) return;
+    final peerConnection = _peerConnection;
+    if (peerConnection == null) {
+      throw StateError('Cannot add audio after peer disposal');
+    }
     try {
       _localStream = await navigator.mediaDevices.getUserMedia({
         'audio': true,
@@ -165,7 +181,7 @@ class WebRTCService {
       });
       final audioTracks = _localStream!.getAudioTracks();
       for (final track in audioTracks) {
-        await _peerConnection!.addTrack(track, _localStream!);
+        await peerConnection.addTrack(track, _localStream!);
       }
       for (final track in audioTracks) {
         track.enabled = true;
@@ -187,20 +203,44 @@ class WebRTCService {
   }
 
   Future<void> stopAudio() async {
-    _localStream?.getTracks().forEach((t) => t.stop());
-    await _localStream?.dispose();
+    final stream = _localStream;
     _localStream = null;
+    _audioActive = false;
+    if (stream == null) return;
+    for (final track in stream.getTracks()) {
+      try {
+        track.stop();
+      } catch (e) {
+        print('Audio track stop failed: $e');
+      }
+    }
+    try {
+      await stream.dispose();
+    } catch (e) {
+      print('Audio stream dispose failed: $e');
+    }
   }
 
   Future<void> _disposeLocalPeerConnectionState() async {
-    await stopAudio();
-    _dataChannel?.close();
+    final dataChannel = _dataChannel;
+    final peerConnection = _peerConnection;
     _dataChannel = null;
-    await _peerConnection?.close();
     _peerConnection = null;
     _isRemoteDescriptionSet = false;
     _audioActive = false;
     _iceCandidateBuffer.clear();
+
+    await stopAudio();
+    try {
+      dataChannel?.close();
+    } catch (e) {
+      print('Data channel close failed: $e');
+    }
+    try {
+      await peerConnection?.close();
+    } catch (e) {
+      print('Peer connection close failed: $e');
+    }
   }
 
   void setMicMuted(bool muted) {
@@ -217,26 +257,38 @@ class WebRTCService {
 
   Future<RTCSessionDescription> createOffer({bool withAudio = false}) async {
     print('[CALL] createOffer');
+    final peerConnection = _peerConnection;
+    if (peerConnection == null) {
+      throw StateError('Cannot create offer after peer disposal');
+    }
     await ensureDataChannel();
     if (withAudio && !isAudioActive) await addAudioTrack();
-    final offer = await _peerConnection!.createOffer();
-    await _peerConnection!.setLocalDescription(offer);
+    final offer = await peerConnection.createOffer();
+    await peerConnection.setLocalDescription(offer);
     return offer;
   }
 
   Future<RTCSessionDescription> createAnswer(RTCSessionDescription offer,
       {bool withAudio = false}) async {
     print('[CALL] createAnswer');
-    await _peerConnection!.setRemoteDescription(offer);
+    final peerConnection = _peerConnection;
+    if (peerConnection == null) {
+      throw StateError('Cannot create answer after peer disposal');
+    }
+    await peerConnection.setRemoteDescription(offer);
     await _markRemoteDescriptionSetAndDrainIce();
     if (withAudio) await addAudioTrack();
-    final answer = await _peerConnection!.createAnswer();
-    await _peerConnection!.setLocalDescription(answer);
+    final answer = await peerConnection.createAnswer();
+    await peerConnection.setLocalDescription(answer);
     return answer;
   }
 
   Future<void> setRemoteDescription(RTCSessionDescription description) async {
-    await _peerConnection!.setRemoteDescription(description);
+    final peerConnection = _peerConnection;
+    if (peerConnection == null) {
+      throw StateError('Cannot set remote description after peer disposal');
+    }
+    await peerConnection.setRemoteDescription(description);
     await _markRemoteDescriptionSetAndDrainIce();
   }
 
@@ -245,13 +297,20 @@ class WebRTCService {
     final buffered = List<RTCIceCandidate>.from(_iceCandidateBuffer);
     _iceCandidateBuffer.clear();
     for (final candidate in buffered) {
-      await _peerConnection!.addCandidate(candidate);
+      final peerConnection = _peerConnection;
+      if (peerConnection == null) return;
+      await peerConnection.addCandidate(candidate);
     }
   }
 
   Future<void> safeAddIceCandidate(RTCIceCandidate candidate) async {
+    final peerConnection = _peerConnection;
+    if (peerConnection == null) {
+      print('[CALL] dropping ICE candidate after peer disposal');
+      return;
+    }
     if (_isRemoteDescriptionSet) {
-      await _peerConnection!.addCandidate(candidate);
+      await peerConnection.addCandidate(candidate);
       return;
     }
     _iceCandidateBuffer.add(candidate);
@@ -262,7 +321,7 @@ class WebRTCService {
   }
 
   void onIceCandidate(Function(RTCIceCandidate) callback) {
-    _peerConnection!.onIceCandidate = (candidate) {
+    _peerConnection?.onIceCandidate = (candidate) {
       callback(candidate);
     };
   }
@@ -275,6 +334,7 @@ class WebRTCService {
   }
 
   Future<void> dispose() async {
-    await _disposeLocalPeerConnectionState();
+    _disposeFuture ??= _disposeLocalPeerConnectionState();
+    await _disposeFuture;
   }
 }

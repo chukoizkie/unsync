@@ -26,6 +26,10 @@ class MercuryTaskHandler extends TaskHandler {
 }
 
 class ForegroundServiceManager {
+  static void wakeScreen() {
+    FlutterForegroundTask.wakeUpScreen();
+  }
+
   static void init() {
     FlutterForegroundTask.init(
       androidNotificationOptions: AndroidNotificationOptions(

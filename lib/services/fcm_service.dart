@@ -3,7 +3,6 @@ import 'package:firebase_messaging/firebase_messaging.dart';
 import 'package:firebase_core/firebase_core.dart';
 import 'package:flutter/widgets.dart';
 import 'package:flutter_foreground_task/flutter_foreground_task.dart';
-import 'call_notification_service.dart';
 import 'message_notification_service.dart';
 
 @pragma('vm:entry-point')
@@ -14,14 +13,15 @@ Future<void> firebaseMessagingBackgroundHandler(RemoteMessage message) async {
   final callerId = message.data['callerId'] as String?;
   final callerName = message.data['callerName'] as String? ?? callerId ?? 'Unknown';
   final type = message.data['type'] as String?;
+  final callId = message.data['callId'] as String?;
 
   if (type == 'call_offer' && callerId != null) {
-    // Wake the screen immediately before anything else so the full-screen
-    // intent has a lit display to take over, even after deep doze.
+    print(
+      '[CALL] FCM wake received while disconnected callerId=$callerId callId=${callId ?? 'missing'}',
+    );
+    // Wake only. Signaling must deliver the real call_offer before call UI opens.
     FlutterForegroundTask.wakeUpScreen();
-    // Promote process to foreground BEFORE posting the call notification.
-    // Without this, aggressive OEMs (Infinix, MIUI) kill the process before
-    // the heads-up / full-screen intent ever fires.
+    // Promote the process briefly so the main isolate has a chance to reconnect.
     FlutterForegroundTask.init(
       androidNotificationOptions: AndroidNotificationOptions(
         channelId: 'unsync_call_service_fg',
@@ -36,12 +36,8 @@ Future<void> firebaseMessagingBackgroundHandler(RemoteMessage message) async {
     await FlutterForegroundTask.startService(
       serviceId: 256,
       notificationTitle: 'Mercury',
-      notificationText: 'Incoming call from $callerName',
+      notificationText: 'Waking for call from $callerName',
     );
-
-    // Now post the actual call notification (full-screen intent, ringtone, etc.)
-    await CallNotificationService.initialize();
-    await CallNotificationService.showIncomingCall(callerName, callerId);
 
   } else if (type == 'message_wake') {
     final fromId = (message.data['fromId'] as String?) ??
@@ -58,15 +54,50 @@ Future<void> firebaseMessagingBackgroundHandler(RemoteMessage message) async {
 
 class FCMService {
   static final _fcm = FirebaseMessaging.instance;
+  static bool _signalingConnected = false;
+
+  static void setSignalingConnected(bool connected) {
+    _signalingConnected = connected;
+  }
 
   static Future<String?> initialize() async {
     FirebaseMessaging.onBackgroundMessage(firebaseMessagingBackgroundHandler);
     await _fcm.requestPermission(alert: true, badge: false, sound: true);
     FirebaseMessaging.onMessage.listen((message) {
+      final type = message.data['type'] as String?;
+      final callerId = message.data['callerId'] as String?;
+      final callId = message.data['callId'] as String?;
+      if (type == 'call_offer' && callerId != null) {
+        if (_signalingConnected) {
+          print(
+            '[CALL] FCM wake ignored because signaling already connected callerId=$callerId callId=${callId ?? 'missing'}',
+          );
+        } else {
+          print(
+            '[CALL] FCM wake received while disconnected callerId=$callerId callId=${callId ?? 'missing'}',
+          );
+        }
+        return;
+      }
       final from = message.data['from'];
       print('FCM ping received (foreground) from: $from');
     });
     FirebaseMessaging.onMessageOpenedApp.listen((message) {
+      final type = message.data['type'] as String?;
+      final callerId = message.data['callerId'] as String?;
+      final callId = message.data['callId'] as String?;
+      if (type == 'call_offer' && callerId != null) {
+        if (_signalingConnected) {
+          print(
+            '[CALL] FCM wake ignored because signaling already connected callerId=$callerId callId=${callId ?? 'missing'}',
+          );
+        } else {
+          print(
+            '[CALL] FCM wake received while disconnected callerId=$callerId callId=${callId ?? 'missing'}',
+          );
+        }
+        return;
+      }
       final from = message.data['from'];
       print('FCM ping - app reopened from: $from');
     });

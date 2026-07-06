@@ -1,4 +1,5 @@
 import 'dart:convert';
+import 'dart:async';
 import 'dart:io';
 import 'dart:typed_data';
 import 'package:flutter/material.dart';
@@ -17,6 +18,7 @@ import '../services/foreground_service.dart';
 import '../services/fcm_service.dart';
 import '../services/call_notification_service.dart';
 import '../services/message_notification_service.dart';
+import '../services/ringtone_service.dart';
 import '../services/biometric_service.dart';
 import '../services/profile_photo_service.dart';
 import 'qr_screen.dart';
@@ -31,34 +33,50 @@ class ContactsScreen extends StatefulWidget {
   State<ContactsScreen> createState() => _ContactsScreenState();
 }
 
-class _ContactsScreenState extends State<ContactsScreen> {
+class _ContactsScreenState extends State<ContactsScreen>
+    with WidgetsBindingObserver {
   int _selectedTab = 0;
-  final _signaling       = SignalingService();
-  final _identity        = IdentityService();
+  final _signaling = SignalingService();
+  final _identity = IdentityService();
   final _contactsService = ContactsService();
   final _messagesService = MessagesService();
-  final _signalService   = SignalService();
-  final _relayService    = RelayService();
+  final _signalService = SignalService();
+  final _relayService = RelayService();
   final _profilePhotoService = ProfilePhotoService();
 
   bool _connected = false;
   List<SavedContact> _realContacts = [];
   String? _profilePhotoPath;
   Map<String, String> _contactPhotoPaths = {};
-  final _newMessageNotifier  = ValueNotifier<String>('');
-  final _connectionNotifier  = ValueNotifier<bool>(false);
+  final _newMessageNotifier = ValueNotifier<String>('');
+  final _connectionNotifier = ValueNotifier<bool>(false);
   final _callAnsweredNotifier = ValueNotifier<bool>(false);
   final _remoteStreamNotifier = ValueNotifier<dynamic>(null);
   String? _pendingCallPeerId;
   String? _openChatPeerId;
   Route<void>? _activeCallRoute;
+  Route<void>? _incomingCallRoute;
   bool _incomingCallRouteOpen = false;
+  AppLifecycleState _lifecycleState = AppLifecycleState.resumed;
+
+  bool get _isAppVisible => _lifecycleState == AppLifecycleState.resumed;
 
   @override
   void initState() {
     super.initState();
+    WidgetsBinding.instance.addObserver(this);
+    _lifecycleState =
+        WidgetsBinding.instance.lifecycleState ?? AppLifecycleState.resumed;
     _loadProfilePhoto();
     _connect();
+  }
+
+  @override
+  void didChangeAppLifecycleState(AppLifecycleState state) {
+    _lifecycleState = state;
+    if (state == AppLifecycleState.resumed) {
+      _drainPendingCallRoute();
+    }
   }
 
   Future<void> _loadProfilePhoto() async {
@@ -82,16 +100,40 @@ class _ContactsScreenState extends State<ContactsScreen> {
     }
   }
 
-  void _queueIncomingCallRoute(String callerId) {
+  void _queueIncomingCallRoute(
+    String callerId, {
+    bool requirePendingOffer = false,
+  }) {
+    if (requirePendingOffer &&
+        !_signaling.hasPendingIncomingCallFrom(callerId)) {
+      print(
+        '[CALL] notification tap ignored because no pending signaling offer callerId=$callerId',
+      );
+      return;
+    }
     _pendingCallPeerId = callerId;
+    if (!_isAppVisible) {
+      print(
+        '[CALL] incoming route deferred because app is not visible callerId=$callerId state=${_lifecycleState.name}',
+      );
+      return;
+    }
     _drainPendingCallRoute();
   }
 
   void _drainPendingCallRoute() {
     if (!mounted) return;
+    if (!_isAppVisible) return;
     if (_incomingCallRouteOpen) return;
     final callerId = _pendingCallPeerId;
     if (callerId == null) return;
+    if (!_signaling.hasPendingIncomingCallFrom(callerId)) {
+      print(
+        '[CALL] incoming route ignored because no pending signaling offer callerId=$callerId',
+      );
+      _pendingCallPeerId = null;
+      return;
+    }
 
     _pendingCallPeerId = null;
     _incomingCallRouteOpen = true;
@@ -106,30 +148,42 @@ class _ContactsScreenState extends State<ContactsScreen> {
       ),
     );
 
-    Navigator.push(
-      context,
-      MaterialPageRoute(
-        builder: (_) => IncomingCallScreen(
-          callerName: saved.displayName,
-          onDecline: () {
-            _signaling.declineCall();
-            try { CallNotificationService.cancel(); } catch (_) {}
-            Navigator.pop(context);
-          },
-          onAccept: () async {
-            try { CallNotificationService.cancel(); } catch (_) {}
-            await _signaling.acceptCall();
-            if (context.mounted) {
-              final route = _createCallRoute(saved.displayName, false);
-              Navigator.pushReplacement(
-                context,
-                route,
-              ).whenComplete(() => _clearCallRoute(route));
-            }
-          },
-        ),
+    final route = MaterialPageRoute<void>(
+      builder: (_) => IncomingCallScreen(
+        callerName: saved.displayName,
+        onDecline: () async {
+          final navigator = Navigator.of(context);
+          await RingtoneService.stopRinging();
+          _signaling.declineCall();
+          try {
+            await CallNotificationService.cancel();
+          } catch (_) {}
+          if (!mounted) return;
+          if (navigator.canPop()) navigator.pop();
+        },
+        onAccept: () async {
+          final navigator = Navigator.of(context);
+          await RingtoneService.stopRinging();
+          try {
+            await CallNotificationService.cancel();
+          } catch (_) {}
+          final accepted = await _signaling.acceptCall();
+          if (!accepted) {
+            if (mounted) navigator.pop();
+            return;
+          }
+          if (mounted) {
+            final route = _createCallRoute(saved.displayName, false);
+            navigator
+                .pushReplacement(route)
+                .whenComplete(() => _clearCallRoute(route));
+          }
+        },
       ),
-    ).whenComplete(() {
+    );
+    _incomingCallRoute = route;
+    Navigator.push(context, route).whenComplete(() {
+      if (_incomingCallRoute == route) _incomingCallRoute = null;
       _incomingCallRouteOpen = false;
       if (_pendingCallPeerId != null) {
         _drainPendingCallRoute();
@@ -144,7 +198,8 @@ class _ContactsScreenState extends State<ContactsScreen> {
       await Future.microtask(() => _signalService.initialize());
       await _reloadContacts();
 
-      final id = _identity.peerId ?? DateTime.now().millisecondsSinceEpoch.toString();
+      final id =
+          _identity.peerId ?? DateTime.now().millisecondsSinceEpoch.toString();
 
       await CallNotificationService.initialize();
       await MessageNotificationService.initialize();
@@ -156,47 +211,57 @@ class _ContactsScreenState extends State<ContactsScreen> {
         await _reloadContacts();
         final saved = _realContacts.firstWhere(
           (c) => c.peerId == peerId,
-          orElse: () => SavedContact(peerId: peerId, displayName: peerId, addedAt: DateTime.now()),
+          orElse: () => SavedContact(
+            peerId: peerId,
+            displayName: peerId,
+            addedAt: DateTime.now(),
+          ),
         );
         if (!mounted) return;
         final contact = Contact(
           id: saved.peerId,
           name: saved.displayName,
           initials: saved.displayName.substring(0, 1).toUpperCase(),
-          lastMessage: '', time: '', online: true,
+          lastMessage: '',
+          time: '',
+          online: true,
           photoPath: _contactPhotoPaths[saved.peerId],
         );
         _openChatPeerId = saved.peerId;
-        Navigator.push(context, MaterialPageRoute(
-          builder: (_) => ChatScreen(
-            contact: contact,
-            signaling: _signaling,
-            relayService: _relayService,
-            connectionNotifier: _connectionNotifier,
-            myId: _identity.peerId,
-            myName: _identity.displayName,
-            onProcessBundle: (pid, bundle) async =>
-                await _signalService.processPreKeyBundleFromMap(pid, bundle),
-            onInitializeSession: (pid, bundle) async =>
-                await _signalService.initializeSession(pid, bundle),
-            messagesService: _messagesService,
-            newMessageNotifier: _newMessageNotifier,
-            onMessageSaved: (text, isSent) =>
-                _messagesService.addMessage(contact.id, text, isSent),
-            onEncrypt: (text) async {
-              if (_signalService.isInitialized) {
-                return await _signalService.encrypt(contact.id, text);
-              }
-              throw SignalSessionMissingException(contact.id);
-            },
-            callAnsweredNotifier: _callAnsweredNotifier,
-            remoteStreamNotifier: _remoteStreamNotifier,
+        Navigator.push(
+          context,
+          MaterialPageRoute(
+            builder: (_) => ChatScreen(
+              contact: contact,
+              signaling: _signaling,
+              relayService: _relayService,
+              connectionNotifier: _connectionNotifier,
+              myId: _identity.peerId,
+              myName: _identity.displayName,
+              onProcessBundle: (pid, bundle) async =>
+                  await _signalService.processPreKeyBundleFromMap(pid, bundle),
+              onInitializeSession: (pid, bundle) async =>
+                  await _signalService.initializeSession(pid, bundle),
+              messagesService: _messagesService,
+              newMessageNotifier: _newMessageNotifier,
+              onMessageSaved: (text, isSent) =>
+                  _messagesService.addMessage(contact.id, text, isSent),
+              onEncrypt: (text) async {
+                if (_signalService.isInitialized) {
+                  return await _signalService.encrypt(contact.id, text);
+                }
+                throw SignalSessionMissingException(contact.id);
+              },
+              callAnsweredNotifier: _callAnsweredNotifier,
+              remoteStreamNotifier: _remoteStreamNotifier,
+              onStartVoiceCall: _startOutgoingCall,
+            ),
           ),
-        )).whenComplete(() => _openChatPeerId = null);
+        ).whenComplete(() => _openChatPeerId = null);
       };
 
       CallNotificationService.onNotificationTapped = (callerId) {
-        _queueIncomingCallRoute(callerId);
+        _queueIncomingCallRoute(callerId, requirePendingOffer: true);
       };
 
       // ── FCM ────────────────────────────────────────────────────────────────
@@ -209,15 +274,19 @@ class _ContactsScreenState extends State<ContactsScreen> {
         try {
           final bundle = await _signalService.buildPreKeyBundle();
           _relayService.uploadBundle(id, {
-            'registrationId':      bundle.getRegistrationId(),
-            'identityKey':         base64Encode(bundle.getIdentityKey().serialize()),
-            'preKeyId':            bundle.getPreKeyId(),
-            'preKey':              base64Encode(bundle.getPreKey()!.serialize()),
-            'signedPreKeyId':      bundle.getSignedPreKeyId(),
-            'signedPreKey':        base64Encode(bundle.getSignedPreKey()!.serialize()),
-            'signedPreKeySignature': base64Encode(bundle.getSignedPreKeySignature() ?? Uint8List(0)),
+            'registrationId': bundle.getRegistrationId(),
+            'identityKey': base64Encode(bundle.getIdentityKey().serialize()),
+            'preKeyId': bundle.getPreKeyId(),
+            'preKey': base64Encode(bundle.getPreKey()!.serialize()),
+            'signedPreKeyId': bundle.getSignedPreKeyId(),
+            'signedPreKey': base64Encode(bundle.getSignedPreKey()!.serialize()),
+            'signedPreKeySignature': base64Encode(
+              bundle.getSignedPreKeySignature() ?? Uint8List(0),
+            ),
           });
-        } catch (e) { print('Bundle upload failed: \$e'); }
+        } catch (e) {
+          print('Bundle upload failed: \$e');
+        }
       });
 
       _relayService.onQueuedMessage = (from, payload) async {
@@ -227,32 +296,50 @@ class _ContactsScreenState extends State<ContactsScreen> {
             if (!_signalService.hasSession(from)) {
               final senderBundle = await _relayService.fetchBundle(from);
               if (senderBundle != null) {
-                await _signalService.processPreKeyBundleFromMap(from, senderBundle);
+                await _signalService.processPreKeyBundleFromMap(
+                  from,
+                  senderBundle,
+                );
               }
             }
             text = await _signalService.decrypt(from, payload);
-          } catch (e) { print('Relay decrypt error: \$e'); }
+          } catch (e) {
+            print('Relay decrypt error: \$e');
+          }
         }
         await _messagesService.addMessage(from, text, false);
         print(
           'Relay queued message from=$from notifier=$from:${DateTime.now().millisecondsSinceEpoch}',
         );
-        _newMessageNotifier.value = '${from}:${DateTime.now().millisecondsSinceEpoch}';
+        _newMessageNotifier.value =
+            '${from}:${DateTime.now().millisecondsSinceEpoch}';
         MessageNotificationService.playMessageSound();
-        final senderName = _realContacts.firstWhere(
-          (c) => c.peerId == from,
-          orElse: () => SavedContact(peerId: from, displayName: from, addedAt: DateTime.now()),
-        ).displayName;
-        MessageNotificationService.showMessageNotification(senderName, text, peerId: from);
+        final senderName = _realContacts
+            .firstWhere(
+              (c) => c.peerId == from,
+              orElse: () => SavedContact(
+                peerId: from,
+                displayName: from,
+                addedAt: DateTime.now(),
+              ),
+            )
+            .displayName;
+        MessageNotificationService.showMessageNotification(
+          senderName,
+          text,
+          peerId: from,
+        );
       };
 
       // ── signaling ──────────────────────────────────────────────────────────
       _signaling.onConnectionStateChanged = (connected) {
+        FCMService.setSignalingConnected(connected);
         _connectionNotifier.value = connected;
         if (mounted) setState(() => _connected = connected);
       };
 
       _signaling.onPeerOffline = (peerId) {
+        FCMService.setSignalingConnected(false);
         _connectionNotifier.value = false;
         if (mounted) setState(() => _connected = false);
       };
@@ -260,10 +347,25 @@ class _ContactsScreenState extends State<ContactsScreen> {
       _signaling.onIncomingCall = (peerId) async {
         final saved = _realContacts.firstWhere(
           (c) => c.peerId == peerId,
-          orElse: () => SavedContact(peerId: peerId, displayName: peerId, addedAt: DateTime.now()),
+          orElse: () => SavedContact(
+            peerId: peerId,
+            displayName: peerId,
+            addedAt: DateTime.now(),
+          ),
         );
-        await CallNotificationService.showIncomingCall(saved.displayName, peerId);
-        _queueIncomingCallRoute(peerId);
+        if (_isAppVisible) {
+          _queueIncomingCallRoute(peerId);
+        } else {
+          ForegroundServiceManager.wakeScreen();
+          await CallNotificationService.showIncomingCall(
+            saved.displayName,
+            peerId,
+          );
+          _pendingCallPeerId = peerId;
+          print(
+            '[CALL] incoming notification posted for background signaling offer callerId=$peerId state=${_lifecycleState.name}',
+          );
+        }
       };
 
       _signaling.onCallAnswered = () {
@@ -275,30 +377,40 @@ class _ContactsScreenState extends State<ContactsScreen> {
       };
 
       _signaling.onCallEnded = () {
-        try { CallNotificationService.cancel(); } catch (_) {}
+        unawaited(RingtoneService.stopRinging().catchError((_) {}));
+        unawaited(CallNotificationService.cancel().catchError((_) {}));
         _callAnsweredNotifier.value = false;
         _remoteStreamNotifier.value = null;
+        _pendingCallPeerId = null;
+        _popIncomingCallRoute();
         _popActiveCallRoute();
       };
 
       // ── killed-state notification resume ───────────────────────────────────
       Future.microtask(() async {
-        final initialCallerId = await CallNotificationService.getInitialCallerId();
+        final initialCallerId =
+            await CallNotificationService.getInitialCallerId();
         if (initialCallerId != null) {
           for (int i = 0; i < 30; i++) {
             await Future.delayed(const Duration(milliseconds: 500));
             if (_signaling.myId != null && _realContacts.isNotEmpty) break;
           }
-          if (mounted) _queueIncomingCallRoute(initialCallerId);
+          if (mounted) {
+            _queueIncomingCallRoute(initialCallerId, requirePendingOffer: true);
+          }
         }
 
-        final initialPeerId = await MessageNotificationService.getInitialPeerId();
+        final initialPeerId =
+            await MessageNotificationService.getInitialPeerId();
         if (initialPeerId != null) {
           for (int i = 0; i < 30; i++) {
             await Future.delayed(const Duration(milliseconds: 500));
             if (_signaling.myId != null && _realContacts.isNotEmpty) break;
           }
-          if (mounted) MessageNotificationService.onNotificationTapped?.call(initialPeerId);
+          if (mounted)
+            MessageNotificationService.onNotificationTapped?.call(
+              initialPeerId,
+            );
         }
 
         final prefs = await SharedPreferences.getInstance();
@@ -310,7 +422,10 @@ class _ContactsScreenState extends State<ContactsScreen> {
             await Future.delayed(const Duration(milliseconds: 500));
             if (_signaling.myId != null && _realContacts.isNotEmpty) break;
           }
-          if (mounted) MessageNotificationService.onNotificationTapped?.call(pendingFromId);
+          if (mounted)
+            MessageNotificationService.onNotificationTapped?.call(
+              pendingFromId,
+            );
         }
       });
 
@@ -320,7 +435,7 @@ class _ContactsScreenState extends State<ContactsScreen> {
           final parsed = jsonDecode(msg);
           if (parsed['type'] == 'handshake') {
             final name = parsed['name'] as String;
-            final hid  = parsed['peerId'] as String;
+            final hid = parsed['peerId'] as String;
             await _contactsService.addContact(hid, name);
             final photoBase64 = parsed['photoBase64'];
             if (photoBase64 is String && photoBase64.isNotEmpty) {
@@ -328,7 +443,10 @@ class _ContactsScreenState extends State<ContactsScreen> {
                 print('Ignoring oversized profile photo');
               } else {
                 try {
-                  await _contactsService.saveContactPhoto(hid, base64Decode(photoBase64));
+                  await _contactsService.saveContactPhoto(
+                    hid,
+                    base64Decode(photoBase64),
+                  );
                 } catch (e) {
                   print('Failed to save profile photo: $e');
                 }
@@ -339,16 +457,28 @@ class _ContactsScreenState extends State<ContactsScreen> {
               final b = parsed['signalBundle'];
               try {
                 final bundle = signal.PreKeyBundle(
-                  b['registrationId'], 1,
+                  b['registrationId'],
+                  1,
                   b['preKeyId'],
-                  signal.Curve.decodePoint(base64Decode(b['preKey'] as String), 0),
+                  signal.Curve.decodePoint(
+                    base64Decode(b['preKey'] as String),
+                    0,
+                  ),
                   b['signedPreKeyId'],
-                  signal.Curve.decodePoint(base64Decode(b['signedPreKey'] as String), 0),
+                  signal.Curve.decodePoint(
+                    base64Decode(b['signedPreKey'] as String),
+                    0,
+                  ),
                   base64Decode(b['signedPreKeySignature'] as String),
-                  signal.IdentityKey.fromBytes(base64Decode(b['identityKey'] as String), 0),
+                  signal.IdentityKey.fromBytes(
+                    base64Decode(b['identityKey'] as String),
+                    0,
+                  ),
                 );
                 await _signalService.processPreKeyBundle(hid, bundle);
-              } catch (e) { print('Signal bundle error: \$e'); }
+              } catch (e) {
+                print('Signal bundle error: \$e');
+              }
             }
             return;
           }
@@ -367,17 +497,20 @@ class _ContactsScreenState extends State<ContactsScreen> {
             print(
               'P2P message peerId=$peerId notifier=$peerId:${DateTime.now().millisecondsSinceEpoch}',
             );
-            _newMessageNotifier.value = '${peerId}:${DateTime.now().millisecondsSinceEpoch}';
+            _newMessageNotifier.value =
+                '${peerId}:${DateTime.now().millisecondsSinceEpoch}';
             setState(() {
               MessageNotificationService.playMessageSound();
-              final senderName = _realContacts.firstWhere(
-                (c) => c.peerId == peerId,
-                orElse: () => SavedContact(
-                  peerId: peerId,
-                  displayName: peerId,
-                  addedAt: DateTime.now(),
-                ),
-              ).displayName;
+              final senderName = _realContacts
+                  .firstWhere(
+                    (c) => c.peerId == peerId,
+                    orElse: () => SavedContact(
+                      peerId: peerId,
+                      displayName: peerId,
+                      addedAt: DateTime.now(),
+                    ),
+                  )
+                  .displayName;
               MessageNotificationService.showMessageNotification(
                 senderName,
                 plaintext,
@@ -391,21 +524,23 @@ class _ContactsScreenState extends State<ContactsScreen> {
       _signaling.onPeerConnected = (peerId) async {
         _connectionNotifier.value = true;
         final myName = _identity.displayName ?? 'Unknown';
-        final myId2  = _identity.peerId ?? '';
+        final myId2 = _identity.peerId ?? '';
         final bundle = await _signalService.buildPreKeyBundle();
         final handshake = <String, dynamic>{
           'type': 'handshake',
           'name': myName,
           'peerId': myId2,
           'signalBundle': {
-            'registrationId':      bundle.getRegistrationId(),
-            'identityKey':         base64Encode(bundle.getIdentityKey().serialize()),
-            'preKeyId':            bundle.getPreKeyId(),
-            'preKey':              base64Encode(bundle.getPreKey()!.serialize()),
-            'signedPreKeyId':      bundle.getSignedPreKeyId(),
-            'signedPreKey':        base64Encode(bundle.getSignedPreKey()!.serialize()),
-            'signedPreKeySignature': base64Encode(bundle.getSignedPreKeySignature()!),
-          }
+            'registrationId': bundle.getRegistrationId(),
+            'identityKey': base64Encode(bundle.getIdentityKey().serialize()),
+            'preKeyId': bundle.getPreKeyId(),
+            'preKey': base64Encode(bundle.getPreKey()!.serialize()),
+            'signedPreKeyId': bundle.getSignedPreKeyId(),
+            'signedPreKey': base64Encode(bundle.getSignedPreKey()!.serialize()),
+            'signedPreKeySignature': base64Encode(
+              bundle.getSignedPreKeySignature()!,
+            ),
+          },
         };
         final profilePhotoPath = _profilePhotoPath;
         if (profilePhotoPath != null) {
@@ -417,7 +552,11 @@ class _ContactsScreenState extends State<ContactsScreen> {
         _signaling.sendMessage(peerId, jsonEncode(handshake));
       };
 
-      await _signaling.connect(id, fcmToken: fcmToken, handle: _identity.displayName);
+      await _signaling.connect(
+        id,
+        fcmToken: fcmToken,
+        handle: _identity.displayName,
+      );
       ForegroundServiceManager.start();
 
       FirebaseMessaging.onMessage.listen((message) {
@@ -425,7 +564,6 @@ class _ContactsScreenState extends State<ContactsScreen> {
           _relayService.connect(id, fcmToken: fcmToken);
         }
       });
-
     } catch (e, stack) {
       print('Connect error: \$e');
       print(stack);
@@ -452,7 +590,10 @@ class _ContactsScreenState extends State<ContactsScreen> {
     );
   }
 
-  MaterialPageRoute<void> _createCallRoute(String contactName, bool isOutgoing) {
+  MaterialPageRoute<void> _createCallRoute(
+    String contactName,
+    bool isOutgoing,
+  ) {
     final route = MaterialPageRoute<void>(
       settings: const RouteSettings(name: 'call'),
       builder: (_) => _buildCallScreen(contactName, isOutgoing),
@@ -465,24 +606,62 @@ class _ContactsScreenState extends State<ContactsScreen> {
     if (_activeCallRoute == route) _activeCallRoute = null;
   }
 
+  Future<bool> _startOutgoingCall(Contact contact) async {
+    if (_activeCallRoute != null || _incomingCallRouteOpen) {
+      print('[CALL] outgoing UI blocked because another call route is active');
+      return false;
+    }
+
+    final started = await _signaling.startVoiceCall(
+      contact.id,
+      callerName: _identity.displayName ?? '',
+    );
+    if (!started || !mounted) return false;
+
+    final route = _createCallRoute(contact.name, true);
+    Navigator.push(context, route).whenComplete(() => _clearCallRoute(route));
+    return true;
+  }
+
+  void _popIncomingCallRoute() {
+    final route = _incomingCallRoute;
+    if (!mounted || route == null || !route.isActive) return;
+    final navigator = Navigator.of(context);
+    if (route.isCurrent) {
+      navigator.pop();
+    } else {
+      navigator.removeRoute(route);
+    }
+    _incomingCallRoute = null;
+    _incomingCallRouteOpen = false;
+  }
+
   void _popActiveCallRoute() {
     final route = _activeCallRoute;
-    if (!mounted || route == null || !route.isCurrent) return;
-    Navigator.of(context).pop();
+    if (!mounted || route == null || !route.isActive) return;
+    final navigator = Navigator.of(context);
+    if (route.isCurrent) {
+      navigator.pop();
+    } else {
+      navigator.removeRoute(route);
+    }
     _activeCallRoute = null;
   }
 
   void _openQR(BuildContext context) {
-    Navigator.push(context, MaterialPageRoute(
-      builder: (_) => QRScreen(
-        peerId: _identity.peerId ?? '',
-        displayName: _identity.displayName ?? 'Unknown',
-        onContactScanned: (peerId, name) async {
-          await _contactsService.addContact(peerId, name);
-          await _reloadContacts();
-        },
+    Navigator.push(
+      context,
+      MaterialPageRoute(
+        builder: (_) => QRScreen(
+          peerId: _identity.peerId ?? '',
+          displayName: _identity.displayName ?? 'Unknown',
+          onContactScanned: (peerId, name) async {
+            await _contactsService.addContact(peerId, name);
+            await _reloadContacts();
+          },
+        ),
       ),
-    ));
+    );
   }
 
   void _showSettings(BuildContext context) {
@@ -511,7 +690,10 @@ class _ContactsScreenState extends State<ContactsScreen> {
         children: [
           ListTile(
             leading: const Icon(Icons.delete_outline, color: Colors.redAccent),
-            title: const Text('Clear chat history', style: TextStyle(color: kText)),
+            title: const Text(
+              'Clear chat history',
+              style: TextStyle(color: kText),
+            ),
             onTap: () async {
               Navigator.pop(context);
               await _messagesService.clearMessages(contact.id);
@@ -521,7 +703,10 @@ class _ContactsScreenState extends State<ContactsScreen> {
             },
           ),
           ListTile(
-            leading: const Icon(Icons.person_remove_outlined, color: Colors.redAccent),
+            leading: const Icon(
+              Icons.person_remove_outlined,
+              color: Colors.redAccent,
+            ),
             title: const Text('Remove contact', style: TextStyle(color: kText)),
             onTap: () async {
               Navigator.pop(context);
@@ -540,6 +725,8 @@ class _ContactsScreenState extends State<ContactsScreen> {
 
   @override
   void dispose() {
+    WidgetsBinding.instance.removeObserver(this);
+    FCMService.setSignalingConnected(false);
     _signaling.dispose();
     _relayService.dispose();
     _newMessageNotifier.dispose();
@@ -562,7 +749,8 @@ class _ContactsScreenState extends State<ContactsScreen> {
         title: Row(
           children: [
             Container(
-              width: 8, height: 8,
+              width: 8,
+              height: 8,
               decoration: BoxDecoration(
                 color: _connected ? kAccent : kMuted,
                 shape: BoxShape.circle,
@@ -572,12 +760,21 @@ class _ContactsScreenState extends State<ContactsScreen> {
             Column(
               crossAxisAlignment: CrossAxisAlignment.start,
               children: [
-                const Text('Mercury',
-                  style: TextStyle(color: kText, fontSize: 20,
-                    fontWeight: FontWeight.w700, letterSpacing: -0.5)),
+                const Text(
+                  'Mercury',
+                  style: TextStyle(
+                    color: kText,
+                    fontSize: 20,
+                    fontWeight: FontWeight.w700,
+                    letterSpacing: -0.5,
+                  ),
+                ),
                 Text(
                   _connected ? 'mesh connected' : 'connecting...',
-                  style: TextStyle(color: _connected ? kAccent : kMuted, fontSize: 10),
+                  style: TextStyle(
+                    color: _connected ? kAccent : kMuted,
+                    fontSize: 10,
+                  ),
                 ),
               ],
             ),
@@ -606,8 +803,10 @@ class _ContactsScreenState extends State<ContactsScreen> {
               width: double.infinity,
               padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
               color: const Color(0xFF1A1A00),
-              child: const Text('⚡ connecting to mesh...',
-                style: TextStyle(color: kAccent, fontSize: 11)),
+              child: const Text(
+                '⚡ connecting to mesh...',
+                style: TextStyle(color: kAccent, fontSize: 11),
+              ),
             ),
           if (_connected)
             GestureDetector(
@@ -617,13 +816,25 @@ class _ContactsScreenState extends State<ContactsScreen> {
                   context: context,
                   builder: (_) => AlertDialog(
                     backgroundColor: kSurface,
-                    title: const Text('Your Peer ID', style: TextStyle(color: kText)),
-                    content: SelectableText(id,
-                      style: const TextStyle(color: kAccent, fontSize: 12, fontFamily: 'monospace')),
+                    title: const Text(
+                      'Your Peer ID',
+                      style: TextStyle(color: kText),
+                    ),
+                    content: SelectableText(
+                      id,
+                      style: const TextStyle(
+                        color: kAccent,
+                        fontSize: 12,
+                        fontFamily: 'monospace',
+                      ),
+                    ),
                     actions: [
                       TextButton(
                         onPressed: () => Navigator.pop(context),
-                        child: const Text('Close', style: TextStyle(color: kAccent)),
+                        child: const Text(
+                          'Close',
+                          style: TextStyle(color: kAccent),
+                        ),
                       ),
                     ],
                   ),
@@ -631,16 +842,24 @@ class _ContactsScreenState extends State<ContactsScreen> {
               },
               child: Container(
                 width: double.infinity,
-                padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
+                padding: const EdgeInsets.symmetric(
+                  horizontal: 16,
+                  vertical: 8,
+                ),
                 color: const Color(0xFF001A0D),
-                child: const Text('✅ mesh connected — tap to see your ID',
-                  style: TextStyle(color: kAccent, fontSize: 11)),
+                child: const Text(
+                  '✅ mesh connected — tap to see your ID',
+                  style: TextStyle(color: kAccent, fontSize: 11),
+                ),
               ),
             ),
           Padding(
             padding: const EdgeInsets.fromLTRB(16, 16, 16, 8),
             child: Container(
-              decoration: BoxDecoration(color: kSurface, border: Border.all(color: kBorder)),
+              decoration: BoxDecoration(
+                color: kSurface,
+                border: Border.all(color: kBorder),
+              ),
               child: const TextField(
                 style: TextStyle(color: kText, fontSize: 14),
                 decoration: InputDecoration(
@@ -668,54 +887,68 @@ class _ContactsScreenState extends State<ContactsScreen> {
               itemCount: _realContacts.length,
               separatorBuilder: (_, _) => Container(height: 1, color: kBorder),
               itemBuilder: (context, index) {
-                if (index >= _realContacts.length) return const SizedBox.shrink();
+                if (index >= _realContacts.length)
+                  return const SizedBox.shrink();
                 final c = _realContacts[index];
                 final contact = Contact(
                   id: c.peerId,
                   name: c.displayName,
                   initials: c.displayName.substring(0, 1).toUpperCase(),
-                  lastMessage: _selectedTab == 0 ? 'Tap to chat' : 'Tap to call',
-                  time: '', online: true,
+                  lastMessage: _selectedTab == 0
+                      ? 'Tap to chat'
+                      : 'Tap to call',
+                  time: '',
+                  online: true,
                   photoPath: _contactPhotoPaths[c.peerId],
                 );
                 return _ContactTile(
                   contact: contact,
                   onLongPress: () => _showContactOptions(context, contact),
-                  onTap: () {
+                  onTap: () async {
                     if (_selectedTab == 1) {
-                      _signaling.startVoiceCall(contact.id, callerName: _identity.displayName ?? '');
-                      final route = _createCallRoute(contact.name, true);
-                      Navigator.push(context, route)
-                          .whenComplete(() => _clearCallRoute(route));
+                      await _startOutgoingCall(contact);
                       return;
                     }
                     _openChatPeerId = contact.id;
-                    Navigator.push(context, MaterialPageRoute(
-                      builder: (_) => ChatScreen(
-                        contact: contact,
-                        signaling: _signaling,
-                        relayService: _relayService,
-                        connectionNotifier: _connectionNotifier,
-                        myId: _identity.peerId,
-                        myName: _identity.displayName,
-                        onProcessBundle: (pid, bundle) async =>
-                            await _signalService.processPreKeyBundleFromMap(pid, bundle),
-                        onInitializeSession: (pid, bundle) async =>
-                            await _signalService.initializeSession(pid, bundle),
-                        messagesService: _messagesService,
-                        newMessageNotifier: _newMessageNotifier,
-                        onMessageSaved: (text, isSent) =>
-                            _messagesService.addMessage(contact.id, text, isSent),
-                        onEncrypt: (text) async {
-                          if (_signalService.isInitialized) {
-                            return await _signalService.encrypt(contact.id, text);
-                          }
-                          throw SignalSessionMissingException(contact.id);
-                        },
-                        callAnsweredNotifier: _callAnsweredNotifier,
-                        remoteStreamNotifier: _remoteStreamNotifier,
+                    Navigator.push(
+                      context,
+                      MaterialPageRoute(
+                        builder: (_) => ChatScreen(
+                          contact: contact,
+                          signaling: _signaling,
+                          relayService: _relayService,
+                          connectionNotifier: _connectionNotifier,
+                          myId: _identity.peerId,
+                          myName: _identity.displayName,
+                          onProcessBundle: (pid, bundle) async =>
+                              await _signalService.processPreKeyBundleFromMap(
+                                pid,
+                                bundle,
+                              ),
+                          onInitializeSession: (pid, bundle) async =>
+                              await _signalService.initializeSession(
+                                pid,
+                                bundle,
+                              ),
+                          messagesService: _messagesService,
+                          newMessageNotifier: _newMessageNotifier,
+                          onMessageSaved: (text, isSent) => _messagesService
+                              .addMessage(contact.id, text, isSent),
+                          onEncrypt: (text) async {
+                            if (_signalService.isInitialized) {
+                              return await _signalService.encrypt(
+                                contact.id,
+                                text,
+                              );
+                            }
+                            throw SignalSessionMissingException(contact.id);
+                          },
+                          callAnsweredNotifier: _callAnsweredNotifier,
+                          remoteStreamNotifier: _remoteStreamNotifier,
+                          onStartVoiceCall: _startOutgoingCall,
+                        ),
                       ),
-                    )).whenComplete(() => _openChatPeerId = null);
+                    ).whenComplete(() => _openChatPeerId = null);
                   },
                 );
               },
@@ -749,7 +982,9 @@ class _ContactsScreenState extends State<ContactsScreen> {
           textAlign: TextAlign.center,
           style: TextStyle(
             color: selected ? kAccent : kMuted,
-            fontSize: 12, fontWeight: FontWeight.w600, letterSpacing: 0.5,
+            fontSize: 12,
+            fontWeight: FontWeight.w600,
+            letterSpacing: 0.5,
           ),
         ),
       ),
@@ -762,11 +997,17 @@ class _ContactTile extends StatelessWidget {
   final Contact contact;
   final VoidCallback onTap;
   final VoidCallback? onLongPress;
-  const _ContactTile({required this.contact, required this.onTap, this.onLongPress});
+  const _ContactTile({
+    required this.contact,
+    required this.onTap,
+    this.onLongPress,
+  });
 
   @override
   Widget build(BuildContext context) {
-    final photoFile = contact.photoPath == null ? null : File(contact.photoPath!);
+    final photoFile = contact.photoPath == null
+        ? null
+        : File(contact.photoPath!);
     final hasPhoto = photoFile != null && photoFile.existsSync();
 
     return InkWell(
@@ -786,25 +1027,34 @@ class _ContactTile extends StatelessWidget {
                   )
                 else
                   Container(
-                    width: 46, height: 46,
+                    width: 46,
+                    height: 46,
                     decoration: BoxDecoration(
                       color: kAccentDim,
                       border: Border.all(color: kBorder),
                       shape: BoxShape.circle,
                     ),
                     child: Center(
-                      child: Text(contact.initials,
-                        style: const TextStyle(color: kAccent, fontSize: 16,
-                          fontWeight: FontWeight.w700)),
+                      child: Text(
+                        contact.initials,
+                        style: const TextStyle(
+                          color: kAccent,
+                          fontSize: 16,
+                          fontWeight: FontWeight.w700,
+                        ),
+                      ),
                     ),
                   ),
                 if (contact.online)
                   Positioned(
-                    right: 0, bottom: 0,
+                    right: 0,
+                    bottom: 0,
                     child: Container(
-                      width: 12, height: 12,
+                      width: 12,
+                      height: 12,
                       decoration: BoxDecoration(
-                        color: kAccent, shape: BoxShape.circle,
+                        color: kAccent,
+                        shape: BoxShape.circle,
                         border: Border.all(color: kBg, width: 2),
                       ),
                     ),
@@ -816,13 +1066,21 @@ class _ContactTile extends StatelessWidget {
               child: Column(
                 crossAxisAlignment: CrossAxisAlignment.start,
                 children: [
-                  Text(contact.name,
-                    style: const TextStyle(color: kText, fontSize: 15,
-                      fontWeight: FontWeight.w600)),
+                  Text(
+                    contact.name,
+                    style: const TextStyle(
+                      color: kText,
+                      fontSize: 15,
+                      fontWeight: FontWeight.w600,
+                    ),
+                  ),
                   const SizedBox(height: 3),
-                  Text(contact.lastMessage,
-                    maxLines: 1, overflow: TextOverflow.ellipsis,
-                    style: const TextStyle(color: kMuted, fontSize: 13)),
+                  Text(
+                    contact.lastMessage,
+                    maxLines: 1,
+                    overflow: TextOverflow.ellipsis,
+                    style: const TextStyle(color: kMuted, fontSize: 13),
+                  ),
                 ],
               ),
             ),
@@ -830,20 +1088,31 @@ class _ContactTile extends StatelessWidget {
             Column(
               crossAxisAlignment: CrossAxisAlignment.end,
               children: [
-                Text(contact.time,
+                Text(
+                  contact.time,
                   style: TextStyle(
                     color: contact.unread > 0 ? kAccent : kMuted,
                     fontSize: 11,
-                  )),
+                  ),
+                ),
                 const SizedBox(height: 4),
                 if (contact.unread > 0)
                   Container(
-                    width: 20, height: 20,
-                    decoration: const BoxDecoration(color: kAccent, shape: BoxShape.circle),
+                    width: 20,
+                    height: 20,
+                    decoration: const BoxDecoration(
+                      color: kAccent,
+                      shape: BoxShape.circle,
+                    ),
                     child: Center(
-                      child: Text('\${contact.unread}',
-                        style: const TextStyle(color: kBg, fontSize: 11,
-                          fontWeight: FontWeight.w700)),
+                      child: Text(
+                        '\${contact.unread}',
+                        style: const TextStyle(
+                          color: kBg,
+                          fontSize: 11,
+                          fontWeight: FontWeight.w700,
+                        ),
+                      ),
                     ),
                   ),
               ],
@@ -875,7 +1144,7 @@ class _SettingsSheet extends StatefulWidget {
 class _SettingsSheetState extends State<_SettingsSheet> {
   final _profilePhotoService = ProfilePhotoService();
   bool _bioAvailable = false;
-  bool _bioEnabled   = false;
+  bool _bioEnabled = false;
   String? _profilePhotoPath;
 
   @override
@@ -886,9 +1155,13 @@ class _SettingsSheetState extends State<_SettingsSheet> {
   }
 
   Future<void> _loadBio() async {
-    final avail   = await BiometricService.isAvailable();
+    final avail = await BiometricService.isAvailable();
     final enabled = await BiometricService.isEnabled();
-    if (mounted) setState(() { _bioAvailable = avail; _bioEnabled = enabled; });
+    if (mounted)
+      setState(() {
+        _bioAvailable = avail;
+        _bioEnabled = enabled;
+      });
   }
 
   Future<void> _pickProfilePhoto() async {
@@ -939,7 +1212,10 @@ class _SettingsSheetState extends State<_SettingsSheet> {
                   ),
           ),
           const SizedBox(height: 8),
-          const Text('Change photo', style: TextStyle(color: kAccent, fontSize: 12)),
+          const Text(
+            'Change photo',
+            style: TextStyle(color: kAccent, fontSize: 12),
+          ),
         ],
       ),
     );
@@ -949,26 +1225,41 @@ class _SettingsSheetState extends State<_SettingsSheet> {
   Widget build(BuildContext context) {
     return Padding(
       padding: EdgeInsets.only(
-        left: 24, right: 24, top: 24,
+        left: 24,
+        right: 24,
+        top: 24,
         bottom: MediaQuery.of(context).viewInsets.bottom + 24,
       ),
       child: Column(
         mainAxisSize: MainAxisSize.min,
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
-          const Text('Settings',
-            style: TextStyle(color: kText, fontSize: 18, fontWeight: FontWeight.bold)),
+          const Text(
+            'Settings',
+            style: TextStyle(
+              color: kText,
+              fontSize: 18,
+              fontWeight: FontWeight.bold,
+            ),
+          ),
           const SizedBox(height: 16),
           Center(child: _buildProfilePhoto()),
           const SizedBox(height: 16),
-          const Text('Display name', style: TextStyle(color: kMuted, fontSize: 12)),
+          const Text(
+            'Display name',
+            style: TextStyle(color: kMuted, fontSize: 12),
+          ),
           const SizedBox(height: 8),
           TextField(
             controller: widget.controller,
             style: const TextStyle(color: kText),
             decoration: const InputDecoration(
-              enabledBorder: OutlineInputBorder(borderSide: BorderSide(color: kBorder)),
-              focusedBorder: OutlineInputBorder(borderSide: BorderSide(color: kAccent)),
+              enabledBorder: OutlineInputBorder(
+                borderSide: BorderSide(color: kBorder),
+              ),
+              focusedBorder: OutlineInputBorder(
+                borderSide: BorderSide(color: kAccent),
+              ),
             ),
           ),
           const SizedBox(height: 16),
@@ -1001,10 +1292,14 @@ class _SettingsSheetState extends State<_SettingsSheet> {
                 const Column(
                   crossAxisAlignment: CrossAxisAlignment.start,
                   children: [
-                    Text('Biometric lock',
-                      style: TextStyle(color: kText, fontSize: 14)),
-                    Text('Require fingerprint on open',
-                      style: TextStyle(color: kMuted, fontSize: 11)),
+                    Text(
+                      'Biometric lock',
+                      style: TextStyle(color: kText, fontSize: 14),
+                    ),
+                    Text(
+                      'Require fingerprint on open',
+                      style: TextStyle(color: kMuted, fontSize: 11),
+                    ),
                   ],
                 ),
                 Switch(
