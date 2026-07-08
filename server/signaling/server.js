@@ -5,7 +5,8 @@ const serviceAccount = require('./serviceAccount.json');
 admin.initializeApp({ credential: admin.credential.cert(serviceAccount) });
 
 const PORT = Number(process.env.SIGNALING_PORT || 4000);
-const CALL_TTL_MS = Number(process.env.CALL_TTL_MS || 60_000);
+// Ringing/offline call offers live at most 60 seconds, even if the env asks for more
+const CALL_TTL_MS = Math.min(Number(process.env.CALL_TTL_MS || 60_000), 60_000);
 const MAX_BUFFERED_ICE = Number(process.env.MAX_BUFFERED_ICE || 50);
 
 const wss = new WebSocket.Server({ port: PORT });
@@ -58,7 +59,7 @@ function expireOldCalls() {
   for (const [callId, call] of activeCalls) {
     if (call.status === 'ringing' && call.expiresAt <= now) {
       activeCalls.delete(callId);
-      console.log(`pending call expired: ${callId}`);
+      console.log(`expired pending ringing call dropped: ${callId}`);
     }
   }
 }
@@ -67,7 +68,7 @@ setInterval(expireOldCalls, 10_000).unref();
 
 async function sendFCMPing(token, fromId, extraData = {}) {
   try {
-    await admin.messaging().send({
+    const messageId = await admin.messaging().send({
       token,
       data: {
         type: 'ping',
@@ -78,23 +79,45 @@ async function sendFCMPing(token, fromId, extraData = {}) {
       },
       android: { priority: 'high' },
     });
-    console.log('FCM ping sent to ' + token.substring(0, 20));
+    return { ok: true, messageId };
   } catch (e) {
-    console.log('FCM ping failed: ' + e.message);
+    return {
+      ok: false,
+      errorCode: e.code || 'unknown',
+      errorMessage: e.message || String(e),
+    };
   }
 }
 
-async function wakeForCall(calleeId, callerId, callerName, callId) {
+async function wakeForCall(calleeId, callerId, callerName, callId, expiresAt) {
   const token = fcmTokens.get(calleeId);
   if (!token) return false;
-  await sendFCMPing(token, callerId, {
+  const tokenPrefix = token.substring(0, 20);
+  const result = await sendFCMPing(token, callerId, {
     type: 'call_offer',
     callerId,
     callerName: callerName || callerId,
     callId,
+    expiresAt,
   });
-  console.log(`call_offer FCM wake sent to ${calleeId} callId=${callId}`);
-  return true;
+  if (result.ok) {
+    console.log(
+      `call_offer FCM wake sent calleeId=${calleeId} callId=${callId} tokenPrefix=${tokenPrefix} messageId=${result.messageId}`
+    );
+    return true;
+  }
+
+  console.log(
+    `call_offer FCM wake failed calleeId=${calleeId} callId=${callId} tokenPrefix=${tokenPrefix} errorCode=${result.errorCode} errorMessage=${result.errorMessage}`
+  );
+  if (
+    result.errorCode === 'messaging/registration-token-not-registered' ||
+    result.errorCode === 'messaging/invalid-registration-token'
+  ) {
+    fcmTokens.delete(calleeId);
+    console.log(`removed invalid FCM token calleeId=${calleeId} callId=${callId} tokenPrefix=${tokenPrefix}`);
+  }
+  return false;
 }
 
 function deliverPendingCalls(peerId) {
@@ -103,10 +126,16 @@ function deliverPendingCalls(peerId) {
   const ws = peers.get(peerId);
   if (!isOpen(ws)) return;
 
+  const now = Date.now();
   for (const call of activeCalls.values()) {
     if (call.callee !== peerId) continue;
     if (call.status !== 'ringing') {
       activeCalls.delete(call.callId);
+      continue;
+    }
+    if (call.expiresAt <= now) {
+      activeCalls.delete(call.callId);
+      console.log(`expired pending ringing call dropped: ${call.callId}`);
       continue;
     }
 
@@ -124,8 +153,10 @@ function deliverPendingCalls(peerId) {
       sdp: call.offer,
       callerName: call.callerName,
       callId: call.callId,
+      createdAt: call.createdAt,
+      expiresAt: call.expiresAt,
     });
-    console.log(`pending call_offer delivered: ${call.caller} → ${call.callee} callId=${call.callId}`);
+    console.log(`replaying valid pending ringing call: ${call.caller} → ${call.callee} callId=${call.callId}`);
 
     for (const candidate of call.callerIce.splice(0)) {
       sendJson(ws, {
@@ -264,7 +295,11 @@ function forwardCallEvent(fromId, msg, ws) {
   }
 
   if (type === 'call_end' || type === 'call_declined') {
+    // Deleting the call also drops its buffered caller/callee ICE
     activeCalls.delete(callId);
+    if (call.status === 'ringing') {
+      console.log(`removed ringing call on ${type === 'call_end' ? 'caller end' : 'decline'}: callId=${callId}`);
+    }
     if (isOpen(target)) {
       sendJson(target, { ...msg, from: fromId, to: toId, callId });
       console.log(`${msg.type} forwarded: ${fromId} → ${msg.to} callId=${callId}`);
@@ -311,11 +346,8 @@ wss.on('connection', (ws) => {
         case 'register': {
           myId = String(msg.id);
 
-          const oldWs = peers.get(myId);
-          if (oldWs && oldWs !== ws) {
-            try { oldWs.close(); } catch (_) {}
-          }
-
+          const old = peers.get(myId);
+          if (old && old !== ws) { try { old.terminate(); } catch {} }
           peers.set(myId, ws);
           socketIds.set(ws, myId);
           if (msg.fcmToken) fcmTokens.set(myId, String(msg.fcmToken));
@@ -376,15 +408,21 @@ wss.on('connection', (ws) => {
 
           const target = peers.get(callee);
           if (isOpen(target)) {
-            sendJson(target, { ...msg, from: caller, callId });
+            sendJson(target, {
+              ...msg,
+              from: caller,
+              callId,
+              createdAt: call.createdAt,
+              expiresAt: call.expiresAt,
+            });
             console.log(`call_offer forwarded: ${caller} → ${callee} callId=${callId}`);
           } else {
-            const woke = await wakeForCall(callee, caller, callerName, callId);
+            const woke = await wakeForCall(callee, caller, callerName, callId, call.expiresAt);
             if (!woke) {
               activeCalls.delete(callId);
               sendJson(ws, { type: 'error', message: 'Peer not found or offline' });
             } else {
-              console.log(`pending call stored: ${caller} → ${callee} callId=${callId}`);
+              console.log(`stored offline ringing call: ${caller} → ${callee} callId=${callId} expiresAt=${call.expiresAt}`);
             }
           }
           break;
@@ -432,6 +470,12 @@ wss.on('connection', (ws) => {
   ws.on('close', () => {
     const id = myId || socketIds.get(ws);
     socketIds.delete(ws);
-    if (id && peers.get(id) === ws) handleDisconnect(id);
+    if (id) {
+      if (peers.get(id) === ws) {
+        handleDisconnect(id);
+      } else {
+        console.log(`Stale socket closed for ${id}, keeping newer registration`);
+      }
+    }
   });
 });
