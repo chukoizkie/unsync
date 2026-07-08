@@ -29,6 +29,20 @@ void main() {
     expect(actual.endsWith('\n'), isFalse);
   });
 
+  test('builds the signaling auth canonical signing string byte-for-byte', () {
+    const expected =
+        'cloaknet-auth-v1|signaling|mercury-peer|signaling-nonce|1234567890';
+    final actual = IdentityService.signalingAuthSigningString(
+      peerId: 'mercury-peer',
+      nonce: 'signaling-nonce',
+      serverTime: 1234567890,
+    );
+
+    expect(actual, expected);
+    expect(utf8.encode(actual), utf8.encode(expected));
+    expect(actual.endsWith('\n'), isFalse);
+  });
+
   test('creates a relay mesh identity when missing', () async {
     SharedPreferences.setMockInitialValues({'peer_id': 'mercury-peer'});
 

@@ -23,9 +23,10 @@ const List<int> _ed25519SpkiPrefix = [
 ];
 
 const bool _relayAuthDebug = bool.fromEnvironment('RELAY_AUTH_DEBUG');
+const bool _signalingAuthDebug = bool.fromEnvironment('SIGNALING_AUTH_DEBUG');
 
-class MeshRelayAuthResponse {
-  const MeshRelayAuthResponse({
+class MeshAuthResponse {
+  const MeshAuthResponse({
     required this.peerId,
     required this.publicKey,
     required this.signature,
@@ -35,6 +36,8 @@ class MeshRelayAuthResponse {
   final String publicKey;
   final String signature;
 }
+
+typedef MeshRelayAuthResponse = MeshAuthResponse;
 
 class _MeshIdentity {
   const _MeshIdentity({
@@ -82,7 +85,7 @@ class IdentityService {
 
   bool get isSetup => _displayName != null && _displayName!.isNotEmpty;
 
-  Future<MeshRelayAuthResponse?> signRelayAuthChallenge({
+  Future<MeshAuthResponse?> signRelayAuthChallenge({
     required String version,
     required String nonce,
     required Object serverTime,
@@ -93,25 +96,32 @@ class IdentityService {
       return null;
     }
 
-    final privateKey = _ed25519PrivateKey(identity.privateKey);
-    final payload = relayAuthSigningString(
+    return _signAuthChallenge(
+      identity: identity,
       version: version,
-      peerId: identity.peerId,
+      role: 'relay',
       nonce: nonce,
       serverTime: serverTime,
+      debugLogPrefix: _relayAuthDebug ? '[relay-auth]' : null,
     );
-    if (_relayAuthDebug) {
-      print('[relay-auth] signing_string=$payload');
-    }
-    final signature = ed25519.sign(
-      privateKey,
-      Uint8List.fromList(utf8.encode(payload)),
-    );
+  }
 
-    return MeshRelayAuthResponse(
-      peerId: identity.peerId,
-      publicKey: _relayPublicKey(identity.publicKey),
-      signature: _base64UrlNoPadding(signature),
+  Future<MeshAuthResponse?> signSignalingAuthChallenge({
+    required String nonce,
+    required Object serverTime,
+  }) async {
+    final identity = await _loadMeshIdentity();
+    if (identity == null) {
+      return null;
+    }
+
+    return _signAuthChallenge(
+      identity: identity,
+      version: 'cloaknet-auth-v1',
+      role: 'signaling',
+      nonce: nonce,
+      serverTime: serverTime,
+      debugLogPrefix: _signalingAuthDebug ? '[signaling-auth]' : null,
     );
   }
 
@@ -121,7 +131,80 @@ class IdentityService {
     required String nonce,
     required Object serverTime,
   }) {
-    return '$version|relay|$peerId|$nonce|$serverTime';
+    return authSigningString(
+      version: version,
+      role: 'relay',
+      peerId: peerId,
+      nonce: nonce,
+      serverTime: serverTime,
+    );
+  }
+
+  static String signalingAuthSigningString({
+    required String peerId,
+    required String nonce,
+    required Object serverTime,
+  }) {
+    return authSigningString(
+      version: 'cloaknet-auth-v1',
+      role: 'signaling',
+      peerId: peerId,
+      nonce: nonce,
+      serverTime: serverTime,
+    );
+  }
+
+  static String authSigningString({
+    required String version,
+    required String role,
+    required String peerId,
+    required String nonce,
+    required Object serverTime,
+  }) {
+    return '$version|$role|$peerId|$nonce|$serverTime';
+  }
+
+  MeshAuthResponse _signAuthChallenge({
+    required _MeshIdentity identity,
+    required String version,
+    required String role,
+    required String nonce,
+    required Object serverTime,
+    required String? debugLogPrefix,
+  }) {
+    final privateKey = _ed25519PrivateKey(identity.privateKey);
+    final payload = authSigningString(
+      version: version,
+      role: role,
+      peerId: identity.peerId,
+      nonce: nonce,
+      serverTime: serverTime,
+    );
+    if (debugLogPrefix != null) {
+      print('$debugLogPrefix signing_string=$payload');
+    }
+    final signature = ed25519.sign(
+      privateKey,
+      Uint8List.fromList(utf8.encode(payload)),
+    );
+
+    return MeshAuthResponse(
+      peerId: identity.peerId,
+      publicKey: _relayPublicKey(identity.publicKey),
+      signature: _base64UrlNoPadding(signature),
+    );
+  }
+
+  Future<_MeshIdentity?> _loadMeshIdentity() async {
+    try {
+      final encoded = await _secureStorage.read(key: _meshIdentityKey);
+      if (encoded == null || encoded.isEmpty) {
+        return null;
+      }
+      return _meshIdentityFromJson(encoded);
+    } catch (_) {
+      return null;
+    }
   }
 
   Future<_MeshIdentity?> _loadOrCreateMeshIdentity() async {

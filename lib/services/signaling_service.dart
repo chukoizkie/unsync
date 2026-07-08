@@ -2,6 +2,7 @@ import 'dart:async';
 import 'dart:convert';
 import '../config.dart';
 import '../models/call_session.dart';
+import 'identity_service.dart';
 import 'package:flutter_webrtc/flutter_webrtc.dart';
 import 'package:web_socket_channel/web_socket_channel.dart';
 import 'package:web_socket_channel/io.dart';
@@ -12,6 +13,7 @@ class SignalingService {
   static const int _idleTimeoutSeconds = 120;
 
   WebSocketChannel? _channel;
+  final IdentityService _identityService;
 
   final Map<String, WebRTCService> _peers = {};
   final Map<String, Timer> _idleTimers = {};
@@ -31,7 +33,7 @@ class SignalingService {
   String? get myId => _myId;
   String? _fcmToken;
 
-  // DHT identity — set before connecting
+  // DHT identity - set before connecting
   String? _myHandle;
 
   CallSession? _activeCall;
@@ -52,26 +54,33 @@ class SignalingService {
   Timer? _reconnectTimer;
   Future<void>? _activeCallCleanup;
 
+  SignalingService({IdentityService? identityService})
+    : _identityService = identityService ?? IdentityService();
+
   Future<void> connect(String myId, {String? fcmToken, String? handle}) async {
     _fcmToken = fcmToken;
     _myId     = myId;
     _myHandle = handle;
 
     _channel = IOWebSocketChannel.connect(Uri.parse(signalingUrl));
-    _channel!.stream.listen((data) {
-      final msg = jsonDecode(data as String);
-      _handleMessage(msg);
-    }, onError: (e) {
-      print('Signaling error: $e');
-      _registered = false;
-      onConnectionStateChanged?.call(false);
-      _scheduleReconnect();
-    }, onDone: () {
-      print('Signaling disconnected');
-      _registered = false;
-      onConnectionStateChanged?.call(false);
-      _scheduleReconnect();
-    });
+    _channel!.stream.listen(
+      (data) {
+        final msg = jsonDecode(data as String);
+        _handleMessage(msg);
+      },
+      onError: (e) {
+        print('Signaling error: $e');
+        _registered = false;
+        onConnectionStateChanged?.call(false);
+        _scheduleReconnect();
+      },
+      onDone: () {
+        print('Signaling disconnected');
+        _registered = false;
+        onConnectionStateChanged?.call(false);
+        _scheduleReconnect();
+      },
+    );
 
     _send({'type': 'register', 'id': myId, 'fcmToken': _fcmToken});
   }
@@ -94,6 +103,19 @@ class SignalingService {
 
   void _handleMessage(Map<String, dynamic> msg) async {
     switch (msg['type']) {
+      case 'auth_challenge':
+        await _handleAuthChallenge(msg);
+        break;
+
+      case 'auth_ok':
+        print('Signaling auth_ok');
+        break;
+
+      case 'auth_error':
+        final reason = msg['reason']?.toString() ?? 'unknown';
+        print('Signaling auth_error $reason');
+        break;
+
       case 'registered':
         print('Registered as: ${msg['id']}');
         _registered = true;
@@ -209,43 +231,46 @@ class SignalingService {
         onIncomingCall?.call(fromId);
         break;
 
-      case 'call_declined': {
-        final callId = msg['callId'] as String?;
-        if (!_isActiveCallEvent(callId, 'call_declined')) {
+      case 'call_declined':
+        {
+          final callId = msg['callId'] as String?;
+          if (!_isActiveCallEvent(callId, 'call_declined')) {
+            break;
+          }
+          await _cleanupActiveCall(reason: 'call_declined');
           break;
         }
-        await _cleanupActiveCall(reason: 'call_declined');
-        break;
-      }
 
-      case 'call_answer': {
-        final fromId = msg['from'] as String;
-        final callId = msg['callId'] as String?;
-        if (!_isActiveCallEvent(callId, 'call_answer')) {
+      case 'call_answer':
+        {
+          final fromId = msg['from'] as String;
+          final callId = msg['callId'] as String?;
+          if (!_isActiveCallEvent(callId, 'call_answer')) {
+            break;
+          }
+          print('[CALL] answer received from $fromId callId=$callId');
+          final webrtc = _peers[fromId];
+          if (webrtc == null) break;
+          await webrtc.setRemoteDescription(
+            RTCSessionDescription(msg['sdp']['sdp'], msg['sdp']['type']),
+          );
+          await _flushPendingCallIceCandidates(callId!, webrtc);
+          _activeCall?.state = CallSessionState.active;
+          onCallAnswered?.call();
           break;
         }
-        print('[CALL] answer received from $fromId callId=$callId');
-        final webrtc = _peers[fromId];
-        if (webrtc == null) break;
-        await webrtc.setRemoteDescription(
-          RTCSessionDescription(msg['sdp']['sdp'], msg['sdp']['type']),
-        );
-        await _flushPendingCallIceCandidates(callId!, webrtc);
-        _activeCall?.state = CallSessionState.active;
-        onCallAnswered?.call();
-        break;
-      }
 
-      case 'call_end': {
-        final fromId = msg['from'] as String;
-        final callId = msg['callId'] as String?;
-        if (!_isActiveCallEvent(callId, 'call_end')) {
+      case 'call_end':
+        {
+          final fromId = msg['from'] as String;
+          final callId = msg['callId'] as String?;
+          if (!_isActiveCallEvent(callId, 'call_end')) {
+            break;
+          }
+          print('[CALL] call ended by $fromId callId=$callId');
+          await _cleanupActiveCall(reason: 'call_end');
           break;
         }
-        print('[CALL] call ended by $fromId callId=$callId');
-        await _cleanupActiveCall(reason: 'call_end');
-        break;
-      }
 
       case 'error':
         final message = msg['message']?.toString() ?? 'Unknown error';
@@ -268,8 +293,37 @@ class SignalingService {
     }
   }
 
-  Future<WebRTCService> _getOrCreatePeer(String peerId,
-      {bool isInitiator = true, bool sendInitialOffer = true}) async {
+  Future<void> _handleAuthChallenge(Map<String, dynamic> msg) async {
+    final nonce = msg['nonce'];
+    final serverTime = msg['server_time'];
+    if (nonce is! String || (serverTime is! int && serverTime is! String)) {
+      print('Signaling auth identity missing; continuing legacy mode');
+      return;
+    }
+
+    final response = await _identityService.signSignalingAuthChallenge(
+      nonce: nonce,
+      serverTime: serverTime,
+    );
+    if (response == null) {
+      print('Signaling auth identity missing; continuing legacy mode');
+      return;
+    }
+
+    _send({
+      'type': 'auth_response',
+      'peer_id': response.peerId,
+      'pubkey': response.publicKey,
+      'signature': response.signature,
+    });
+    print('Signaling auth_response sent');
+  }
+
+  Future<WebRTCService> _getOrCreatePeer(
+    String peerId, {
+    bool isInitiator = true,
+    bool sendInitialOffer = true,
+  }) async {
     if (_peers.containsKey(peerId)) {
       _resetIdleTimer(peerId);
       return _peers[peerId]!;
@@ -277,17 +331,17 @@ class SignalingService {
 
     final webrtc = WebRTCService();
 
-    // ── DHT: inject our identity so peer can resolve our handle ──
+    // DHT: inject our identity so peer can resolve our handle
     webrtc.ownHandle = _myHandle;
     webrtc.ownPeerId = _myId;
     webrtc.onDhtMessage = (msg) {
-      // Handle dht_find — peer is looking for a handle
+      // Handle dht_find - peer is looking for a handle
       if (msg['type'] == 'dht_find') {
         webrtc.handleDhtFind(msg);
       }
-      // dht_announce / dht_found — just let browser handle via data channel
+      // dht_announce / dht_found - just let browser handle via data channel
     };
-    // ─────────────────────────────────────────────────────────────
+    // DHT setup complete
 
     await webrtc.initialize();
     _peers[peerId] = webrtc;
@@ -445,7 +499,9 @@ class SignalingService {
 
   Future<bool> acceptCall() async {
     final session = _activeCall;
-    if (session == null || !session.isIncoming || session.pendingOffer == null) {
+    if (session == null ||
+        !session.isIncoming ||
+        session.pendingOffer == null) {
       print('[CALL] accept blocked because no SDP offer');
       return false;
     }
