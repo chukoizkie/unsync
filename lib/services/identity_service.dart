@@ -22,6 +22,8 @@ const List<int> _ed25519SpkiPrefix = [
   0x00,
 ];
 
+const bool _relayAuthDebug = bool.fromEnvironment('RELAY_AUTH_DEBUG');
+
 class MeshRelayAuthResponse {
   const MeshRelayAuthResponse({
     required this.peerId,
@@ -92,7 +94,15 @@ class IdentityService {
     }
 
     final privateKey = _ed25519PrivateKey(identity.privateKey);
-    final payload = '$version|relay|${identity.peerId}|$nonce|$serverTime';
+    final payload = relayAuthSigningString(
+      version: version,
+      peerId: identity.peerId,
+      nonce: nonce,
+      serverTime: serverTime,
+    );
+    if (_relayAuthDebug) {
+      print('[relay-auth] signing_string=$payload');
+    }
     final signature = ed25519.sign(
       privateKey,
       Uint8List.fromList(utf8.encode(payload)),
@@ -103,6 +113,15 @@ class IdentityService {
       publicKey: _relayPublicKey(identity.publicKey),
       signature: _base64UrlNoPadding(signature),
     );
+  }
+
+  static String relayAuthSigningString({
+    required String version,
+    required String peerId,
+    required String nonce,
+    required Object serverTime,
+  }) {
+    return '$version|relay|$peerId|$nonce|$serverTime';
   }
 
   Future<_MeshIdentity?> _loadOrCreateMeshIdentity() async {

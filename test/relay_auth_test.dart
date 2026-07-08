@@ -14,6 +14,21 @@ void main() {
     SharedPreferences.setMockInitialValues({});
   });
 
+  test('builds the relay auth canonical signing string byte-for-byte', () {
+    const expected =
+        'cloaknet-auth-v1|relay|mercury-peer|relay-nonce|1234567890';
+    final actual = IdentityService.relayAuthSigningString(
+      version: 'cloaknet-auth-v1',
+      peerId: 'mercury-peer',
+      nonce: 'relay-nonce',
+      serverTime: 1234567890,
+    );
+
+    expect(actual, expected);
+    expect(utf8.encode(actual), utf8.encode(expected));
+    expect(actual.endsWith('\n'), isFalse);
+  });
+
   test('creates a relay mesh identity when missing', () async {
     SharedPreferences.setMockInitialValues({'peer_id': 'mercury-peer'});
 
