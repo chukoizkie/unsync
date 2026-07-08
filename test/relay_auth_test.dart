@@ -3,39 +3,78 @@ import 'dart:convert';
 import 'package:ed25519_edwards/ed25519_edwards.dart' as ed25519;
 import 'package:flutter_secure_storage/flutter_secure_storage.dart';
 import 'package:flutter_test/flutter_test.dart';
+import 'package:shared_preferences/shared_preferences.dart';
 import 'package:unsync/services/identity_service.dart';
 
 const _meshIdentityKey = 'mesh_identity_bundle';
-const _ed25519SpkiPrefix = [
-  0x30,
-  0x2a,
-  0x30,
-  0x05,
-  0x06,
-  0x03,
-  0x2b,
-  0x65,
-  0x70,
-  0x03,
-  0x21,
-  0x00,
-];
 
 void main() {
-  test('signs relay auth challenges with the stored mesh identity', () async {
+  setUp(() {
+    FlutterSecureStorage.setMockInitialValues({});
+    SharedPreferences.setMockInitialValues({});
+  });
+
+  test('creates a relay mesh identity when missing', () async {
+    SharedPreferences.setMockInitialValues({'peer_id': 'mercury-peer'});
+
+    final response = await IdentityService().signRelayAuthChallenge(
+      version: 'cloaknet-auth-v1',
+      nonce: 'relay-nonce',
+      serverTime: 1234567890,
+    );
+
+    expect(response, isNotNull);
+    expect(response!.peerId, 'mercury-peer');
+
+    final stored = await const FlutterSecureStorage().read(
+      key: _meshIdentityKey,
+    );
+    expect(stored, isNotNull);
+
+    final identity = jsonDecode(stored!) as Map<String, dynamic>;
+    expect(identity['peerId'], 'mercury-peer');
+    expect(_decodedLength(identity['publicKey'] as String), 32);
+    expect(_decodedLength(identity['privateKey'] as String), 64);
+  });
+
+  test('reuses an existing relay mesh identity', () async {
+    final keyPair = ed25519.generateKey();
+    final storedIdentity = jsonEncode({
+      'peerId': 'stored-peer',
+      'publicKey': _base64UrlNoPadding(keyPair.publicKey.bytes),
+      'privateKey': base64Encode(keyPair.privateKey.bytes),
+    });
+    FlutterSecureStorage.setMockInitialValues({
+      _meshIdentityKey: storedIdentity,
+    });
+    SharedPreferences.setMockInitialValues({'peer_id': 'different-peer'});
+
+    final response = await IdentityService().signRelayAuthChallenge(
+      version: 'cloaknet-auth-v1',
+      nonce: 'relay-nonce',
+      serverTime: 1234567890,
+    );
+
+    expect(response, isNotNull);
+    expect(response!.peerId, 'stored-peer');
+    expect(
+      await const FlutterSecureStorage().read(key: _meshIdentityKey),
+      storedIdentity,
+    );
+  });
+
+  test('signs the relay auth canonical payload', () async {
     final keyPair = ed25519.generateKey();
     const peerId = 'mercury-peer';
     const nonce = 'relay-nonce';
     const serverTime = 1234567890;
     const version = 'cloaknet-auth-v1';
-    final publicKey = _base64UrlNoPadding(keyPair.publicKey.bytes);
-    final privateKey = base64Encode(keyPair.privateKey.bytes);
 
     FlutterSecureStorage.setMockInitialValues({
       _meshIdentityKey: jsonEncode({
         'peerId': peerId,
-        'publicKey': publicKey,
-        'privateKey': privateKey,
+        'publicKey': _base64UrlNoPadding(keyPair.publicKey.bytes),
+        'privateKey': base64Encode(keyPair.privateKey.bytes),
       }),
     });
 
@@ -47,10 +86,7 @@ void main() {
 
     expect(response, isNotNull);
     expect(response!.peerId, peerId);
-    expect(
-      response.publicKey,
-      _base64UrlNoPadding([..._ed25519SpkiPrefix, ...keyPair.publicKey.bytes]),
-    );
+    expect(response.publicKey, _base64UrlNoPadding(keyPair.publicKey.bytes));
 
     final payload = '$version|relay|$peerId|$nonce|$serverTime';
     expect(
@@ -74,4 +110,8 @@ String _withBase64Padding(String value) {
     return value;
   }
   return value.padRight(value.length + 4 - remainder, '=');
+}
+
+int _decodedLength(String value) {
+  return base64Url.decode(_withBase64Padding(value)).length;
 }

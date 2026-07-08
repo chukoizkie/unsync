@@ -68,7 +68,7 @@ class RelayService {
           await _handleAuthChallenge(msg);
           break;
         case 'auth_ok':
-          print('Relay auth ok');
+          print('Relay auth_ok');
           break;
         case 'auth_failed':
           print('Relay auth failed: ${msg['reason'] ?? 'unknown'}');
@@ -122,7 +122,7 @@ class RelayService {
       serverTime: serverTime,
     );
     if (response == null) {
-      print('Relay auth identity missing; continuing legacy mode');
+      print('Relay auth unavailable');
       return;
     }
 
@@ -132,6 +132,7 @@ class RelayService {
       'pubkey': response.publicKey,
       'signature': response.signature,
     });
+    print('Relay auth_response sent');
   }
 
   void uploadBundle(String peerId, Map<String, dynamic> bundle) {
