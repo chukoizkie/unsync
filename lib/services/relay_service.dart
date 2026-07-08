@@ -1,6 +1,9 @@
+// ignore_for_file: avoid_print
+
 import 'dart:async';
 import 'dart:convert';
 import '../config.dart';
+import 'identity_service.dart';
 import 'package:web_socket_channel/io.dart';
 import 'package:web_socket_channel/web_socket_channel.dart';
 
@@ -12,6 +15,10 @@ class RelayService {
   Timer? _pingTimer;
   Function(String from, String payload)? onQueuedMessage;
   final Map<String, Completer<Map<String, dynamic>?>> _bundleCompleters = {};
+  final IdentityService _identityService;
+
+  RelayService({IdentityService? identityService})
+    : _identityService = identityService ?? IdentityService();
 
   Future<void> connect(String myId, {String? fcmToken}) async {
     if (_reconnecting) return;
@@ -52,17 +59,29 @@ class RelayService {
     }
   }
 
-  void _handleMessage(dynamic data) {
+  Future<void> _handleMessage(dynamic data) async {
     try {
       final msg = jsonDecode(data as String);
       final type = msg['type'] as String?;
       switch (type) {
+        case 'auth_challenge':
+          await _handleAuthChallenge(msg);
+          break;
+        case 'auth_ok':
+          print('Relay auth ok');
+          break;
+        case 'auth_failed':
+          print('Relay auth failed: ${msg['reason'] ?? 'unknown'}');
+          break;
         case 'registered':
           print('Relay registered: ${msg['id']}');
           break;
         case 'queued':
           print('Relay: queued from ${msg['from']}');
-          onQueuedMessage?.call(msg['from'] as String, msg['payload'] as String);
+          onQueuedMessage?.call(
+            msg['from'] as String,
+            msg['payload'] as String,
+          );
           break;
         case 'stored':
           print('Relay: blob stored for ${msg['to']}');
@@ -86,6 +105,35 @@ class RelayService {
     }
   }
 
+  Future<void> _handleAuthChallenge(Map<String, dynamic> msg) async {
+    final version = msg['version'];
+    final nonce = msg['nonce'];
+    final serverTime = msg['server_time'];
+    if (version is! String ||
+        nonce is! String ||
+        (serverTime is! int && serverTime is! String)) {
+      print('Relay auth challenge invalid; continuing legacy mode');
+      return;
+    }
+
+    final response = await _identityService.signRelayAuthChallenge(
+      version: version,
+      nonce: nonce,
+      serverTime: serverTime,
+    );
+    if (response == null) {
+      print('Relay auth identity missing; continuing legacy mode');
+      return;
+    }
+
+    _send({
+      'type': 'auth_response',
+      'peer_id': response.peerId,
+      'pubkey': response.publicKey,
+      'signature': response.signature,
+    });
+  }
+
   void uploadBundle(String peerId, Map<String, dynamic> bundle) {
     _send({'type': 'upload_bundle', 'id': peerId, 'bundle': bundle});
   }
@@ -95,10 +143,13 @@ class RelayService {
     final completer = Completer<Map<String, dynamic>?>();
     _bundleCompleters[peerId] = completer;
     _send({'type': 'get_bundle', 'id': peerId});
-    return completer.future.timeout(const Duration(seconds: 5), onTimeout: () {
-      _bundleCompleters.remove(peerId);
-      return null;
-    });
+    return completer.future.timeout(
+      const Duration(seconds: 5),
+      onTimeout: () {
+        _bundleCompleters.remove(peerId);
+        return null;
+      },
+    );
   }
 
   Future<Map<String, dynamic>?> getBundle(String peerId) => fetchBundle(peerId);
@@ -108,7 +159,12 @@ class RelayService {
       print('Relay: not connected, cannot store');
       return;
     }
-    _send({'type': 'store', 'to': to, 'from': from, 'payload': encryptedPayload});
+    _send({
+      'type': 'store',
+      'to': to,
+      'from': from,
+      'payload': encryptedPayload,
+    });
   }
 
   void _startPing() {
