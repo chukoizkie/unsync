@@ -182,6 +182,14 @@ class SignalingService {
           _rejectStaleCallEvent('call_offer', callId);
           break;
         }
+        final expiresAt = msg['expiresAt'];
+        if (expiresAt is num &&
+            DateTime.now().millisecondsSinceEpoch > expiresAt) {
+          print(
+            '[CALL] expired call_offer rejected callId=$callId expiresAt=$expiresAt',
+          );
+          break;
+        }
         print('[CALL] offer received from $fromId callId=$callId');
         final offer = RTCSessionDescription(
           msg['sdp']['sdp'],

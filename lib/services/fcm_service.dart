@@ -3,10 +3,14 @@ import 'package:firebase_messaging/firebase_messaging.dart';
 import 'package:firebase_core/firebase_core.dart';
 import 'package:flutter/widgets.dart';
 import 'package:flutter_foreground_task/flutter_foreground_task.dart';
+import 'call_notification_service.dart';
 import 'message_notification_service.dart';
 
 @pragma('vm:entry-point')
 Future<void> firebaseMessagingBackgroundHandler(RemoteMessage message) async {
+  print('FCM_BG_HANDLER_ENTERED');
+  print('FCM_BG_HANDLER_DATA ${message.data}');
+  print('FCM_BG_HANDLER_TIMESTAMP ${DateTime.now().toIso8601String()}');
   WidgetsFlutterBinding.ensureInitialized();
   await Firebase.initializeApp();
 
@@ -21,24 +25,8 @@ Future<void> firebaseMessagingBackgroundHandler(RemoteMessage message) async {
     );
     // Wake only. Signaling must deliver the real call_offer before call UI opens.
     FlutterForegroundTask.wakeUpScreen();
-    // Promote the process briefly so the main isolate has a chance to reconnect.
-    FlutterForegroundTask.init(
-      androidNotificationOptions: AndroidNotificationOptions(
-        channelId: 'unsync_call_service_fg',
-        channelName: 'Mercury Call Service',
-        channelImportance: NotificationChannelImportance.LOW,
-      ),
-      iosNotificationOptions: const IOSNotificationOptions(),
-      foregroundTaskOptions: ForegroundTaskOptions(
-        eventAction: ForegroundTaskEventAction.nothing(),
-      ),
-    );
-    await FlutterForegroundTask.startService(
-      serviceId: 256,
-      notificationTitle: 'Mercury',
-      notificationText: 'Waking for call from $callerName',
-    );
-
+    await CallNotificationService.initialize();
+    await CallNotificationService.showIncomingCall(callerName, callerId);
   } else if (type == 'message_wake') {
     final fromId = (message.data['fromId'] as String?) ??
         (message.data['senderId'] as String?) ??
@@ -61,7 +49,6 @@ class FCMService {
   }
 
   static Future<String?> initialize() async {
-    FirebaseMessaging.onBackgroundMessage(firebaseMessagingBackgroundHandler);
     await _fcm.requestPermission(alert: true, badge: false, sound: true);
     FirebaseMessaging.onMessage.listen((message) {
       final type = message.data['type'] as String?;
