@@ -1,3 +1,5 @@
+// ignore_for_file: avoid_print
+
 import 'dart:convert';
 import 'dart:typed_data';
 
@@ -103,7 +105,17 @@ class IdentityService {
   }
 
   Future<_MeshIdentity?> _loadMeshIdentity() async {
+    print(
+      '[relay-auth identity] loading mesh identity; secure-storage keys queried=$_meshIdentityKey',
+    );
     final encoded = await _secureStorage.read(key: _meshIdentityKey);
+    _logIdentityBundleDiagnostics(
+      key: _meshIdentityKey,
+      encoded: encoded,
+      primary: true,
+    );
+    await _logAlternateIdentityCandidates();
+
     if (encoded == null || encoded.isEmpty) {
       return null;
     }
@@ -111,6 +123,9 @@ class IdentityService {
     try {
       final raw = jsonDecode(encoded);
       if (raw is! Map<String, dynamic>) {
+        print(
+          '[relay-auth identity] $_meshIdentityKey validation=false reason=json_not_object',
+        );
         return null;
       }
 
@@ -118,16 +133,123 @@ class IdentityService {
       final publicKey = _stringValue(raw['publicKey']);
       final privateKey = _stringValue(raw['privateKey']);
       if (peerId == null || publicKey == null || privateKey == null) {
+        print(
+          '[relay-auth identity] $_meshIdentityKey validation=false reason=missing_expected_fields',
+        );
         return null;
       }
 
+      print('[relay-auth identity] $_meshIdentityKey validation=true');
       return _MeshIdentity(
         peerId: peerId,
         publicKey: publicKey,
         privateKey: privateKey,
       );
     } catch (_) {
+      print(
+        '[relay-auth identity] $_meshIdentityKey validation=false reason=json_decode_failed',
+      );
       return null;
+    }
+  }
+
+  Future<void> _logAlternateIdentityCandidates() async {
+    try {
+      final values = await _secureStorage.readAll();
+      print(
+        '[relay-auth identity] secure-storage readAll keys=${values.keys.toList()}',
+      );
+      for (final entry in values.entries) {
+        if (entry.key == _meshIdentityKey) {
+          continue;
+        }
+        final lowerKey = entry.key.toLowerCase();
+        final keyLooksRelevant =
+            lowerKey.contains('identity') ||
+            lowerKey.contains('mesh') ||
+            lowerKey.contains('ed25519') ||
+            lowerKey.contains('peer') ||
+            lowerKey.contains('key');
+        if (!keyLooksRelevant) {
+          continue;
+        }
+        _logIdentityBundleDiagnostics(
+          key: entry.key,
+          encoded: entry.value,
+          primary: false,
+        );
+      }
+    } catch (e) {
+      print('[relay-auth identity] secure-storage readAll failed: $e');
+    }
+  }
+
+  static void _logIdentityBundleDiagnostics({
+    required String key,
+    required String? encoded,
+    required bool primary,
+  }) {
+    print(
+      '[relay-auth identity] key=$key primary=$primary returnedNull=${encoded == null} stringLength=${encoded?.length ?? 0}',
+    );
+    if (encoded == null || encoded.isEmpty) {
+      print('[relay-auth identity] key=$key jsonDecodeSucceeded=false');
+      print('[relay-auth identity] key=$key validation=false');
+      return;
+    }
+
+    Object? decoded;
+    try {
+      decoded = jsonDecode(encoded);
+      print('[relay-auth identity] key=$key jsonDecodeSucceeded=true');
+    } catch (e) {
+      print(
+        '[relay-auth identity] key=$key jsonDecodeSucceeded=false error=$e',
+      );
+      print('[relay-auth identity] key=$key validation=false');
+      return;
+    }
+
+    if (decoded is! Map<String, dynamic>) {
+      print('[relay-auth identity] key=$key jsonObject=false');
+      print('[relay-auth identity] key=$key validation=false');
+      return;
+    }
+
+    final peerSnake = _stringValue(decoded['peer_id']);
+    final peerCamel = _stringValue(decoded['peerId']);
+    final pubkeySnake = _stringValue(decoded['pubkey']);
+    final publicKeyCamel = _stringValue(decoded['publicKey']);
+    final privateSnake = _stringValue(decoded['private_key']);
+    final privateCamel = _stringValue(decoded['privateKey']);
+    final publicKey = publicKeyCamel ?? pubkeySnake;
+    final privateKey = privateCamel ?? privateSnake;
+    final expectedFormatValid =
+        peerCamel != null && publicKeyCamel != null && privateCamel != null;
+
+    print(
+      '[relay-auth identity] key=$key fields peer_id=${peerSnake != null} peerId=${peerCamel != null} pubkey=${pubkeySnake != null} publicKey=${publicKeyCamel != null} private_key=${privateSnake != null} privateKey=${privateCamel != null}',
+    );
+    print(
+      '[relay-auth identity] key=$key lengths peer_id=${peerSnake?.length ?? 0} peerId=${peerCamel?.length ?? 0} publicKeyString=${publicKey?.length ?? 0} publicKeyDecoded=${_decodedLength(publicKey)} privateKeyString=${privateKey?.length ?? 0} privateKeyDecoded=${_decodedLength(privateKey)}',
+    );
+    print(
+      '[relay-auth identity] key=$key validation=$expectedFormatValid expectedFormat=peerId/publicKey/privateKey',
+    );
+  }
+
+  static int? _decodedLength(String? value) {
+    if (value == null || value.isEmpty) {
+      return null;
+    }
+    try {
+      return base64Url.decode(_withBase64Padding(value)).length;
+    } catch (_) {
+      try {
+        return base64Decode(value).length;
+      } catch (_) {
+        return null;
+      }
     }
   }
 
