@@ -57,6 +57,8 @@ class _ContactsScreenState extends State<ContactsScreen>
   Route<void>? _activeCallRoute;
   Route<void>? _incomingCallRoute;
   bool _incomingCallRouteOpen = false;
+  Timer? _pendingNotificationLaunchTimer;
+  String? _pendingNotificationCallerId;
   AppLifecycleState _lifecycleState = AppLifecycleState.resumed;
 
   bool get _isAppVisible => _lifecycleState == AppLifecycleState.resumed;
@@ -191,18 +193,74 @@ class _ContactsScreenState extends State<ContactsScreen>
     });
   }
 
+  String _displayNameForPeer(String peerId) {
+    return _realContacts
+        .firstWhere(
+          (c) => c.peerId == peerId,
+          orElse: () => SavedContact(
+            peerId: peerId,
+            displayName: CallNotificationService.lastCallerName ?? peerId,
+            addedAt: DateTime.now(),
+          ),
+        )
+        .displayName;
+  }
+
+  void _handleCallNotificationLaunch(String callerId) {
+    if (_signaling.hasPendingIncomingCallFrom(callerId)) {
+      _completePendingNotificationLaunchIfMatches(callerId);
+      unawaited(CallNotificationService.cancel().catchError((_) {}));
+      _queueIncomingCallRoute(callerId, requirePendingOffer: true);
+      return;
+    }
+
+    _pendingNotificationCallerId = callerId;
+    _pendingNotificationLaunchTimer?.cancel();
+    _pendingNotificationLaunchTimer = Timer(const Duration(seconds: 8), () async {
+      if (_pendingNotificationCallerId != callerId) return;
+      _pendingNotificationLaunchTimer = null;
+      _pendingNotificationCallerId = null;
+
+      if (_signaling.hasPendingIncomingCallFrom(callerId)) {
+        unawaited(CallNotificationService.cancel().catchError((_) {}));
+        _queueIncomingCallRoute(callerId, requirePendingOffer: true);
+        return;
+      }
+
+      await CallNotificationService.cancel();
+      await MessageNotificationService.showMessageNotification(
+        'Missed call from ${_displayNameForPeer(callerId)}',
+        'Tap to open Mercury',
+        peerId: callerId,
+      );
+    });
+  }
+
+  void _completePendingNotificationLaunchIfMatches(String callerId) {
+    if (_pendingNotificationCallerId != callerId) return;
+    _pendingNotificationLaunchTimer?.cancel();
+    _pendingNotificationLaunchTimer = null;
+    _pendingNotificationCallerId = null;
+    unawaited(CallNotificationService.cancel().catchError((_) {}));
+  }
+
+  void _cancelPendingNotificationLaunch() {
+    _pendingNotificationLaunchTimer?.cancel();
+    _pendingNotificationLaunchTimer = null;
+    _pendingNotificationCallerId = null;
+  }
+
   Future<void> _connect() async {
     try {
       ForegroundServiceManager.init();
       await _identity.initialize();
-      await Future.microtask(() => _signalService.initialize());
-      await _reloadContacts();
-
       final id =
           _identity.peerId ?? DateTime.now().millisecondsSinceEpoch.toString();
 
       await CallNotificationService.initialize();
       await MessageNotificationService.initialize();
+      final initialCallerId = await CallNotificationService.getInitialCallerId();
+      await Future.microtask(() => _signalService.initialize());
 
       // ── notification tap handlers ──────────────────────────────────────────
       MessageNotificationService.onNotificationTapped = (peerId) async {
@@ -261,11 +319,69 @@ class _ContactsScreenState extends State<ContactsScreen>
       };
 
       CallNotificationService.onNotificationTapped = (callerId) {
-        _queueIncomingCallRoute(callerId, requirePendingOffer: true);
+        _handleCallNotificationLaunch(callerId);
       };
 
       // ── FCM ────────────────────────────────────────────────────────────────
       final fcmToken = await FCMService.initialize();
+
+      _signaling.onConnectionStateChanged = (connected) {
+        FCMService.setSignalingConnected(connected);
+        _connectionNotifier.value = connected;
+        if (mounted) setState(() => _connected = connected);
+      };
+
+      _signaling.onPeerOffline = (peerId) {
+        FCMService.setSignalingConnected(false);
+        _connectionNotifier.value = false;
+        if (mounted) setState(() => _connected = false);
+      };
+
+      _signaling.onIncomingCall = (peerId) async {
+        _completePendingNotificationLaunchIfMatches(peerId);
+        if (_isAppVisible) {
+          _queueIncomingCallRoute(peerId);
+        } else {
+          ForegroundServiceManager.wakeScreen();
+          await CallNotificationService.showIncomingCall(
+            _displayNameForPeer(peerId),
+            peerId,
+          );
+          _pendingCallPeerId = peerId;
+          print(
+            '[CALL] incoming notification posted for background signaling offer callerId=$peerId state=${_lifecycleState.name}',
+          );
+        }
+      };
+
+      _signaling.onCallEnded = () {
+        _cancelPendingNotificationLaunch();
+        unawaited(RingtoneService.stopRinging().catchError((_) {}));
+        unawaited(CallNotificationService.cancel().catchError((_) {}));
+        _callAnsweredNotifier.value = false;
+        _remoteStreamNotifier.value = null;
+        _pendingCallPeerId = null;
+        _popIncomingCallRoute();
+        _popActiveCallRoute();
+      };
+
+      _signaling.onCallAnswered = () {
+        _callAnsweredNotifier.value = true;
+      };
+
+      _signaling.onRemoteStream = (stream) {
+        _remoteStreamNotifier.value = stream;
+      };
+
+      await _signaling.connect(
+        id,
+        fcmToken: fcmToken,
+        handle: _identity.displayName,
+      );
+      if (initialCallerId != null) {
+        _handleCallNotificationLaunch(initialCallerId);
+      }
+      await _reloadContacts();
 
       // ── relay ──────────────────────────────────────────────────────────────
       await _relayService.connect(id, fcmToken: fcmToken);
@@ -312,7 +428,7 @@ class _ContactsScreenState extends State<ContactsScreen>
           'Relay queued message from=$from notifier=$from:${DateTime.now().millisecondsSinceEpoch}',
         );
         _newMessageNotifier.value =
-            '${from}:${DateTime.now().millisecondsSinceEpoch}';
+            '$from:${DateTime.now().millisecondsSinceEpoch}';
         MessageNotificationService.playMessageSound();
         final senderName = _realContacts
             .firstWhere(
@@ -331,75 +447,8 @@ class _ContactsScreenState extends State<ContactsScreen>
         );
       };
 
-      // ── signaling ──────────────────────────────────────────────────────────
-      _signaling.onConnectionStateChanged = (connected) {
-        FCMService.setSignalingConnected(connected);
-        _connectionNotifier.value = connected;
-        if (mounted) setState(() => _connected = connected);
-      };
-
-      _signaling.onPeerOffline = (peerId) {
-        FCMService.setSignalingConnected(false);
-        _connectionNotifier.value = false;
-        if (mounted) setState(() => _connected = false);
-      };
-
-      _signaling.onIncomingCall = (peerId) async {
-        final saved = _realContacts.firstWhere(
-          (c) => c.peerId == peerId,
-          orElse: () => SavedContact(
-            peerId: peerId,
-            displayName: peerId,
-            addedAt: DateTime.now(),
-          ),
-        );
-        if (_isAppVisible) {
-          _queueIncomingCallRoute(peerId);
-        } else {
-          ForegroundServiceManager.wakeScreen();
-          await CallNotificationService.showIncomingCall(
-            saved.displayName,
-            peerId,
-          );
-          _pendingCallPeerId = peerId;
-          print(
-            '[CALL] incoming notification posted for background signaling offer callerId=$peerId state=${_lifecycleState.name}',
-          );
-        }
-      };
-
-      _signaling.onCallAnswered = () {
-        _callAnsweredNotifier.value = true;
-      };
-
-      _signaling.onRemoteStream = (stream) {
-        _remoteStreamNotifier.value = stream;
-      };
-
-      _signaling.onCallEnded = () {
-        unawaited(RingtoneService.stopRinging().catchError((_) {}));
-        unawaited(CallNotificationService.cancel().catchError((_) {}));
-        _callAnsweredNotifier.value = false;
-        _remoteStreamNotifier.value = null;
-        _pendingCallPeerId = null;
-        _popIncomingCallRoute();
-        _popActiveCallRoute();
-      };
-
       // ── killed-state notification resume ───────────────────────────────────
       Future.microtask(() async {
-        final initialCallerId =
-            await CallNotificationService.getInitialCallerId();
-        if (initialCallerId != null) {
-          for (int i = 0; i < 30; i++) {
-            await Future.delayed(const Duration(milliseconds: 500));
-            if (_signaling.myId != null && _realContacts.isNotEmpty) break;
-          }
-          if (mounted) {
-            _queueIncomingCallRoute(initialCallerId, requirePendingOffer: true);
-          }
-        }
-
         final initialPeerId =
             await MessageNotificationService.getInitialPeerId();
         if (initialPeerId != null) {
@@ -407,10 +456,11 @@ class _ContactsScreenState extends State<ContactsScreen>
             await Future.delayed(const Duration(milliseconds: 500));
             if (_signaling.myId != null && _realContacts.isNotEmpty) break;
           }
-          if (mounted)
+          if (mounted) {
             MessageNotificationService.onNotificationTapped?.call(
               initialPeerId,
             );
+          }
         }
 
         final prefs = await SharedPreferences.getInstance();
@@ -422,10 +472,11 @@ class _ContactsScreenState extends State<ContactsScreen>
             await Future.delayed(const Duration(milliseconds: 500));
             if (_signaling.myId != null && _realContacts.isNotEmpty) break;
           }
-          if (mounted)
+          if (mounted) {
             MessageNotificationService.onNotificationTapped?.call(
               pendingFromId,
             );
+          }
         }
       });
 
@@ -498,7 +549,7 @@ class _ContactsScreenState extends State<ContactsScreen>
               'P2P message peerId=$peerId notifier=$peerId:${DateTime.now().millisecondsSinceEpoch}',
             );
             _newMessageNotifier.value =
-                '${peerId}:${DateTime.now().millisecondsSinceEpoch}';
+                '$peerId:${DateTime.now().millisecondsSinceEpoch}';
             setState(() {
               MessageNotificationService.playMessageSound();
               final senderName = _realContacts
@@ -552,11 +603,6 @@ class _ContactsScreenState extends State<ContactsScreen>
         _signaling.sendMessage(peerId, jsonEncode(handshake));
       };
 
-      await _signaling.connect(
-        id,
-        fcmToken: fcmToken,
-        handle: _identity.displayName,
-      );
       ForegroundServiceManager.start();
 
       FirebaseMessaging.onMessage.listen((message) {
@@ -726,6 +772,7 @@ class _ContactsScreenState extends State<ContactsScreen>
   @override
   void dispose() {
     WidgetsBinding.instance.removeObserver(this);
+    _cancelPendingNotificationLaunch();
     FCMService.setSignalingConnected(false);
     _signaling.dispose();
     _relayService.dispose();
@@ -887,8 +934,9 @@ class _ContactsScreenState extends State<ContactsScreen>
               itemCount: _realContacts.length,
               separatorBuilder: (_, _) => Container(height: 1, color: kBorder),
               itemBuilder: (context, index) {
-                if (index >= _realContacts.length)
+                if (index >= _realContacts.length) {
                   return const SizedBox.shrink();
+                }
                 final c = _realContacts[index];
                 final contact = Contact(
                   id: c.peerId,
@@ -1157,11 +1205,12 @@ class _SettingsSheetState extends State<_SettingsSheet> {
   Future<void> _loadBio() async {
     final avail = await BiometricService.isAvailable();
     final enabled = await BiometricService.isEnabled();
-    if (mounted)
+    if (mounted) {
       setState(() {
         _bioAvailable = avail;
         _bioEnabled = enabled;
       });
+    }
   }
 
   Future<void> _pickProfilePhoto() async {
