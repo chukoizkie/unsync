@@ -8,12 +8,16 @@ import 'package:web_socket_channel/web_socket_channel.dart';
 import 'package:web_socket_channel/io.dart';
 import 'webrtc_service.dart';
 
+typedef SignalingChannelFactory = WebSocketChannel Function(Uri uri);
+
 class SignalingService {
   static const String signalingUrl = UnsyncConfig.signalingUrl;
   static const int _idleTimeoutSeconds = 120;
 
   WebSocketChannel? _channel;
   final IdentityService _identityService;
+  final SignalingChannelFactory _channelFactory;
+  final Duration _authChallengeTimeout;
 
   final Map<String, WebRTCService> _peers = {};
   final Map<String, Timer> _idleTimers = {};
@@ -38,6 +42,9 @@ class SignalingService {
 
   CallSession? _activeCall;
   bool _registered = false;
+  bool _registerSent = false;
+  bool _authErrorReceived = false;
+  int _connectionGeneration = 0;
 
   bool get isConnected => _registered;
   String? get activeCallId => _activeCall?.callId;
@@ -52,29 +59,44 @@ class SignalingService {
 
   Timer? _pingTimer;
   Timer? _reconnectTimer;
+  Timer? _authChallengeTimer;
   Future<void>? _activeCallCleanup;
 
-  SignalingService({IdentityService? identityService})
-    : _identityService = identityService ?? IdentityService();
+  SignalingService({
+    IdentityService? identityService,
+    SignalingChannelFactory? channelFactory,
+    Duration authChallengeTimeout = const Duration(seconds: 2),
+  }) : _identityService = identityService ?? IdentityService(),
+       _channelFactory = channelFactory ?? IOWebSocketChannel.connect,
+       _authChallengeTimeout = authChallengeTimeout;
 
   Future<void> connect(String myId, {String? fcmToken, String? handle}) async {
     _fcmToken = fcmToken;
-    _myId     = myId;
+    _myId = myId;
     _myHandle = handle;
+    _registerSent = false;
+    _authErrorReceived = false;
+    final connectionGeneration = ++_connectionGeneration;
 
-    _channel = IOWebSocketChannel.connect(Uri.parse(signalingUrl));
+    _authChallengeTimer?.cancel();
+    _channel = _channelFactory(Uri.parse(signalingUrl));
     _channel!.stream.listen(
       (data) {
+        if (connectionGeneration != _connectionGeneration) return;
         final msg = jsonDecode(data as String);
-        _handleMessage(msg);
+        _handleMessage(msg, connectionGeneration);
       },
       onError: (e) {
+        if (connectionGeneration != _connectionGeneration) return;
+        _authChallengeTimer?.cancel();
         print('Signaling error: $e');
         _registered = false;
         onConnectionStateChanged?.call(false);
         _scheduleReconnect();
       },
       onDone: () {
+        if (connectionGeneration != _connectionGeneration) return;
+        _authChallengeTimer?.cancel();
         print('Signaling disconnected');
         _registered = false;
         onConnectionStateChanged?.call(false);
@@ -82,6 +104,27 @@ class SignalingService {
       },
     );
 
+    _startAuthChallengeTimeout(connectionGeneration);
+  }
+
+  void _startAuthChallengeTimeout(int connectionGeneration) {
+    _authChallengeTimer?.cancel();
+    _authChallengeTimer = Timer(_authChallengeTimeout, () {
+      if (connectionGeneration != _connectionGeneration || _registerSent) {
+        return;
+      }
+      print('Signaling auth challenge timeout; continuing legacy mode');
+      _sendRegister(connectionGeneration);
+    });
+  }
+
+  void _sendRegister(int connectionGeneration) {
+    if (connectionGeneration != _connectionGeneration || _registerSent) {
+      return;
+    }
+    final myId = _myId;
+    if (myId == null) return;
+    _registerSent = true;
     _send({'type': 'register', 'id': myId, 'fcmToken': _fcmToken});
   }
 
@@ -101,17 +144,26 @@ class SignalingService {
     });
   }
 
-  void _handleMessage(Map<String, dynamic> msg) async {
+  void _handleMessage(
+    Map<String, dynamic> msg,
+    int connectionGeneration,
+  ) async {
     switch (msg['type']) {
       case 'auth_challenge':
-        await _handleAuthChallenge(msg);
+        await _handleAuthChallenge(msg, connectionGeneration);
         break;
 
       case 'auth_ok':
+        _authChallengeTimer?.cancel();
         print('Signaling auth_ok');
+        if (!_authErrorReceived) {
+          _sendRegister(connectionGeneration);
+        }
         break;
 
       case 'auth_error':
+        _authChallengeTimer?.cancel();
+        _authErrorReceived = true;
         final reason = msg['reason']?.toString() ?? 'unknown';
         print('Signaling auth_error $reason');
         break;
@@ -293,11 +345,19 @@ class SignalingService {
     }
   }
 
-  Future<void> _handleAuthChallenge(Map<String, dynamic> msg) async {
+  Future<void> _handleAuthChallenge(
+    Map<String, dynamic> msg,
+    int connectionGeneration,
+  ) async {
+    _authChallengeTimer?.cancel();
+    if (_registerSent) {
+      return;
+    }
     final nonce = msg['nonce'];
     final serverTime = msg['server_time'];
     if (nonce is! String || (serverTime is! int && serverTime is! String)) {
       print('Signaling auth identity missing; continuing legacy mode');
+      _sendRegister(connectionGeneration);
       return;
     }
 
@@ -307,6 +367,10 @@ class SignalingService {
     );
     if (response == null) {
       print('Signaling auth identity missing; continuing legacy mode');
+      _sendRegister(connectionGeneration);
+      return;
+    }
+    if (connectionGeneration != _connectionGeneration || _authErrorReceived) {
       return;
     }
 
@@ -613,6 +677,8 @@ class SignalingService {
   void disconnect() {
     _pingTimer?.cancel();
     _reconnectTimer?.cancel();
+    _authChallengeTimer?.cancel();
+    _connectionGeneration++;
     unawaited(_cleanupActiveCall(reason: 'disconnect'));
     for (final peerId in List<String>.from(_peers.keys)) {
       unawaited(_closePeer(peerId));
