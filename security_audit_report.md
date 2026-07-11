@@ -15,7 +15,7 @@ While the use of the `libsignal_protocol_dart` library is a good foundation for 
 * **Remediation:** Implement an out-of-band key verification mechanism. Calculate fingerprints (Safety Numbers) of the Identity Keys and provide a UI for users to compare them (e.g., by scanning a QR code) to ensure the key actually belongs to the intended peer.
 
 ### [High] Plaintext WebRTC Signaling (Signaling Server Trust)
-* **Location:** `lib/services/signaling_service.dart` (lines 95-103, 140-169) & `server/signaling/server.js` (lines 38-51)
+* **Location:** `lib/services/signaling_service.dart` (lines 95-103, 140-169) & production signaling server (`unsyncsoftware/unsync-cloaknet`, local checkout `C:\dev\unsync-signaling\server.js`, VPS `/root/signaling/server.js`)
 * **Description:** The WebRTC Session Description Protocol (SDP) offers and answers are sent in plaintext via the signaling websocket. While WebRTC uses DTLS-SRTP, an attacker controlling the signaling server can manipulate the SDPs to inject themselves as a proxy, MitM'ing the entire WebRTC connection (both data channels and audio). 
 * **Remediation:** Since there is a Signal Protocol session established, you should encrypt the WebRTC SDP offers and answers *using the Signal session* before sending them over the signaling server. The signaling server should only route encrypted blobs.
 
@@ -52,6 +52,6 @@ While the use of the `libsignal_protocol_dart` library is a good foundation for 
 * **Remediation:** Implement a mechanism to fetch short-lived, time-limited TURN credentials (e.g., using the COTURN REST API) from an authenticated backend endpoint rather than hardcoding them in the client.
 
 ### [Medium] Metadata Leakage at the Signaling & Relay Servers
-* **Location:** `server/signaling/server.js` (lines 46, 56, 84) & `server/relay/relay.js` (lines 43-48)
+* **Location:** production signaling server (`unsyncsoftware/unsync-cloaknet/server.js`) & `server/relay/relay.js` (lines 43-48)
 * **Description:** The server implementations log the exact source (`myId`) and destination (`msg.to`) for knocks, calls, and queued messages. This provides a central point of observation for metadata, allowing the server operator (or an attacker who compromised the server) to build a precise social graph of who is talking to whom and when.
 * **Remediation:** Remove sensitive metadata logging in production. Consider using a "sealed sender" architecture or obfuscated routing where the server only knows the destination and not the source, or route signaling over an anonymizing network.

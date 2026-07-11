@@ -28,6 +28,7 @@ import 'qr_screen.dart';
 import 'call_screen.dart';
 import 'incoming_call_screen.dart';
 import 'chat_screen.dart';
+import 'call_log_screen.dart';
 
 class ContactsScreen extends StatefulWidget {
   const ContactsScreen({super.key});
@@ -449,6 +450,9 @@ class _ContactsScreenState extends State<ContactsScreen>
           await CallNotificationService.showIncomingCall(
             _displayNameForPeer(peerId),
             peerId,
+            callId: _signaling.activeCallId,
+            createdAt: _signaling.activeCallCreatedAt,
+            expiresAt: _signaling.activeCallExpiresAt,
           );
           _pendingCallPeerId = peerId;
           print(
@@ -516,6 +520,13 @@ class _ContactsScreenState extends State<ContactsScreen>
         _pendingCallPeerId = null;
         _popIncomingCallRoute();
         _popActiveCallRoute();
+      };
+
+      _signaling.onCallTimedOut = (callId) {
+        if (!mounted) return;
+        ScaffoldMessenger.of(
+          context,
+        ).showSnackBar(const SnackBar(content: Text('No answer')));
       };
 
       _signaling.onCallAnswered = () {
@@ -1170,6 +1181,12 @@ class _ContactsScreenState extends State<ContactsScreen>
     final selected = _selectedTab == index;
     return GestureDetector(
       onTap: () => setState(() => _selectedTab = index),
+      onLongPress: index == 1
+          ? () => Navigator.push(
+              context,
+              MaterialPageRoute(builder: (_) => const CallLogScreen()),
+            )
+          : null,
       child: Container(
         padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 6),
         decoration: BoxDecoration(

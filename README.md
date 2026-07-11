@@ -54,7 +54,7 @@ Relay Server (offline fallback)/
 ### Prerequisites
 - Flutter 3.x
 - Firebase project (for FCM push notifications)
-- A running signaling server — see `/server/signaling/`
+- A running signaling server from the separate [`unsyncsoftware/unsync-cloaknet`](https://github.com/unsyncsoftware/unsync-cloaknet) repository
 - A running relay server — see `/server/relay/`
 
 ### Configuration
@@ -64,7 +64,7 @@ Relay Server (offline fallback)/
 2. Edit `lib/config.dart`:
 \`\`\`dart
 class UnsyncConfig {
-  static const String signalingUrl = 'ws://YOUR_SERVER:4000';
+  static const String signalingUrl = 'wss://signal.unsync.uk';
   static const String relayUrl = 'ws://YOUR_SERVER:5000';
 }
 \`\`\`
@@ -77,9 +77,17 @@ flutter run
 
 ### Server Setup
 
-Both servers are Node.js, managed with PM2:
+Mercury is a client-only repository and does not contain the production signaling server. For local signaling development, run the separate `unsync-signaling` checkout independently:
 \`\`\`bash
-cd server/signaling && npm install && pm2 start server.js --name unsync-signaling
+cd C:\dev\unsync-signaling
+npm install
+node server.js
+\`\`\`
+
+Production signaling is maintained in `unsyncsoftware/unsync-cloaknet` and deployed at `/root/signaling/server.js` on the VPS. Do not copy `server.js` back into Mercury.
+
+The relay server, if used locally, is still managed separately:
+\`\`\`bash
 cd server/relay && npm install && pm2 start relay.js --name unsync-relay
 \`\`\`
 

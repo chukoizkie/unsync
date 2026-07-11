@@ -3,6 +3,7 @@ import 'dart:async';
 import 'package:flutter/material.dart';
 import '../theme.dart';
 import '../services/ringtone_service.dart';
+import '../services/startup_latency.dart';
 
 class IncomingCallScreen extends StatefulWidget {
   final String callerName;
@@ -26,7 +27,13 @@ class _IncomingCallScreenState extends State<IncomingCallScreen> {
   @override
   void initState() {
     super.initState();
-    unawaited(RingtoneService.startRinging().catchError((_) {}));
+    if (!RingtoneService.isRinging) {
+      StartupLatency.mark('ringtone_start');
+      unawaited(RingtoneService.startRinging().catchError((_) {}));
+    }
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      StartupLatency.mark('incoming_call_screen_first_frame');
+    });
   }
 
   Future<void> _handleAccept() async {
@@ -61,7 +68,8 @@ class _IncomingCallScreenState extends State<IncomingCallScreen> {
             Column(
               children: [
                 Container(
-                  width: 100, height: 100,
+                  width: 100,
+                  height: 100,
                   decoration: BoxDecoration(
                     shape: BoxShape.circle,
                     border: Border.all(color: kAccent, width: 2),
@@ -69,12 +77,19 @@ class _IncomingCallScreenState extends State<IncomingCallScreen> {
                   child: const Icon(Icons.person, color: kAccent, size: 56),
                 ),
                 const SizedBox(height: 24),
-                Text(widget.callerName,
-                  style: const TextStyle(color: kText, fontSize: 28,
-                    fontWeight: FontWeight.w700)),
+                Text(
+                  widget.callerName,
+                  style: const TextStyle(
+                    color: kText,
+                    fontSize: 28,
+                    fontWeight: FontWeight.w700,
+                  ),
+                ),
                 const SizedBox(height: 8),
-                const Text('Incoming call...',
-                  style: TextStyle(color: kMuted, fontSize: 14)),
+                const Text(
+                  'Incoming call...',
+                  style: TextStyle(color: kMuted, fontSize: 14),
+                ),
               ],
             ),
             Padding(
@@ -87,15 +102,23 @@ class _IncomingCallScreenState extends State<IncomingCallScreen> {
                     child: Column(
                       children: [
                         Container(
-                          width: 72, height: 72,
+                          width: 72,
+                          height: 72,
                           decoration: const BoxDecoration(
-                            shape: BoxShape.circle, color: Colors.redAccent),
-                          child: const Icon(Icons.call_end,
-                            color: Colors.white, size: 32),
+                            shape: BoxShape.circle,
+                            color: Colors.redAccent,
+                          ),
+                          child: const Icon(
+                            Icons.call_end,
+                            color: Colors.white,
+                            size: 32,
+                          ),
                         ),
                         const SizedBox(height: 8),
-                        const Text('Decline',
-                          style: TextStyle(color: kMuted, fontSize: 12)),
+                        const Text(
+                          'Decline',
+                          style: TextStyle(color: kMuted, fontSize: 12),
+                        ),
                       ],
                     ),
                   ),
@@ -104,15 +127,23 @@ class _IncomingCallScreenState extends State<IncomingCallScreen> {
                     child: Column(
                       children: [
                         Container(
-                          width: 72, height: 72,
+                          width: 72,
+                          height: 72,
                           decoration: const BoxDecoration(
-                            shape: BoxShape.circle, color: kAccent),
-                          child: const Icon(Icons.call,
-                            color: Colors.black, size: 32),
+                            shape: BoxShape.circle,
+                            color: kAccent,
+                          ),
+                          child: const Icon(
+                            Icons.call,
+                            color: Colors.black,
+                            size: 32,
+                          ),
                         ),
                         const SizedBox(height: 8),
-                        const Text('Accept',
-                          style: TextStyle(color: kMuted, fontSize: 12)),
+                        const Text(
+                          'Accept',
+                          style: TextStyle(color: kMuted, fontSize: 12),
+                        ),
                       ],
                     ),
                   ),

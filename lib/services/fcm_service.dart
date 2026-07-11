@@ -21,15 +21,31 @@ Future<void> firebaseMessagingBackgroundHandler(RemoteMessage message) async {
       message.data['callerName'] as String? ?? callerId ?? 'Unknown';
   final type = message.data['type'] as String?;
   final callId = message.data['callId'] as String?;
+  final createdAt = _dateTimeFromServerMillis(message.data['createdAt']);
+  final expiresAt = _dateTimeFromServerMillis(message.data['expiresAt']);
 
   if (type == 'call_offer' && callerId != null) {
+    if (_isExpired(expiresAt)) {
+      print(
+        '[CALL] expired FCM wake ignored callerId=$callerId callId=${callId ?? 'missing'}',
+      );
+      await CallNotificationService.initialize();
+      await CallNotificationService.cancel();
+      return;
+    }
     print(
       '[CALL] FCM wake received while disconnected callerId=$callerId callId=${callId ?? 'missing'}',
     );
     // Wake only. Signaling must deliver the real call_offer before call UI opens.
     FlutterForegroundTask.wakeUpScreen();
     await CallNotificationService.initialize();
-    await CallNotificationService.showIncomingCall(callerName, callerId);
+    await CallNotificationService.showIncomingCall(
+      callerName,
+      callerId,
+      callId: callId,
+      createdAt: createdAt,
+      expiresAt: expiresAt,
+    );
     if (callId != null) {
       // Default "missed" entry on arrival. The accept/decline hooks in
       // contacts_screen.dart write the same callId later and overwrite this
@@ -83,7 +99,14 @@ class FCMService {
         final type = message.data['type'] as String?;
         final callerId = message.data['callerId'] as String?;
         final callId = message.data['callId'] as String?;
+        final expiresAt = _dateTimeFromServerMillis(message.data['expiresAt']);
         if (type == 'call_offer' && callerId != null) {
+          if (_isExpired(expiresAt)) {
+            print(
+              '[CALL] expired FCM wake ignored callerId=$callerId callId=${callId ?? 'missing'}',
+            );
+            return;
+          }
           if (_signalingConnected) {
             print(
               '[CALL] FCM wake ignored because signaling already connected callerId=$callerId callId=${callId ?? 'missing'}',
@@ -102,7 +125,14 @@ class FCMService {
         final type = message.data['type'] as String?;
         final callerId = message.data['callerId'] as String?;
         final callId = message.data['callId'] as String?;
+        final expiresAt = _dateTimeFromServerMillis(message.data['expiresAt']);
         if (type == 'call_offer' && callerId != null) {
+          if (_isExpired(expiresAt)) {
+            print(
+              '[CALL] expired FCM wake ignored callerId=$callerId callId=${callId ?? 'missing'}',
+            );
+            return;
+          }
           if (_signalingConnected) {
             print(
               '[CALL] FCM wake ignored because signaling already connected callerId=$callerId callId=${callId ?? 'missing'}',
@@ -131,4 +161,23 @@ class FCMService {
   }
 
   static Future<String?> getToken() => _fcm.getToken();
+}
+
+DateTime? _dateTimeFromServerMillis(Object? value) {
+  if (value is num) {
+    return DateTime.fromMillisecondsSinceEpoch(value.toInt());
+  }
+  if (value is String) {
+    final millis = int.tryParse(value);
+    if (millis != null) {
+      return DateTime.fromMillisecondsSinceEpoch(millis);
+    }
+  }
+  return null;
+}
+
+bool _isExpired(DateTime? expiresAt) {
+  if (expiresAt == null) return false;
+  final now = DateTime.now();
+  return now.isAfter(expiresAt) || now.isAtSameMomentAs(expiresAt);
 }

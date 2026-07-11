@@ -3,6 +3,7 @@ import 'package:audioplayers/audioplayers.dart';
 class RingtoneService {
   static final AudioPlayer _player = AudioPlayer();
   static bool _ringing = false;
+  static bool get isRinging => _ringing;
 
   static Future<void> startRinging() async {
     if (_ringing) return;

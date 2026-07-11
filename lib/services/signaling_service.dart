@@ -7,6 +7,7 @@ import 'package:flutter_webrtc/flutter_webrtc.dart';
 import 'package:web_socket_channel/web_socket_channel.dart';
 import 'package:web_socket_channel/io.dart';
 import 'webrtc_service.dart';
+import 'startup_latency.dart';
 
 typedef SignalingChannelFactory = WebSocketChannel Function(Uri uri);
 
@@ -18,6 +19,7 @@ class SignalingService {
   final IdentityService _identityService;
   final SignalingChannelFactory _channelFactory;
   final Duration _authChallengeTimeout;
+  final List<Duration> _reconnectDelays;
 
   final Map<String, WebRTCService> _peers = {};
   final Map<String, Timer> _idleTimers = {};
@@ -31,6 +33,7 @@ class SignalingService {
   Function(String peerId)? onIncomingCall;
   Function()? onCallAnswered;
   Function()? onCallEnded;
+  Function(String callId)? onCallTimedOut;
   Function(dynamic stream)? onRemoteStream;
 
   String? _myId;
@@ -48,6 +51,13 @@ class SignalingService {
 
   bool get isConnected => _registered;
   String? get activeCallId => _activeCall?.callId;
+  DateTime? get activeCallCreatedAt => _activeCall?.createdAt;
+  DateTime? get activeCallExpiresAt => _activeCall?.expiresAt;
+  bool get hasActiveCall => _activeCall != null;
+  bool get hasPendingIncomingCall {
+    final session = _activeCall;
+    return session != null && session.isIncoming && session.hasPendingOffer;
+  }
 
   bool hasPendingIncomingCallFrom(String peerId) {
     final session = _activeCall;
@@ -60,18 +70,32 @@ class SignalingService {
   Timer? _pingTimer;
   Timer? _reconnectTimer;
   Timer? _authChallengeTimer;
+  Timer? _activeCallDeadlineTimer;
   Future<void>? _activeCallCleanup;
 
   SignalingService({
     IdentityService? identityService,
     SignalingChannelFactory? channelFactory,
-    Duration authChallengeTimeout = const Duration(seconds: 2),
+    Duration authChallengeTimeout = const Duration(seconds: 10),
+    List<Duration>? reconnectDelays,
   }) : _identityService = identityService ?? IdentityService(),
        _channelFactory = channelFactory ?? IOWebSocketChannel.connect,
-       _authChallengeTimeout = authChallengeTimeout;
+       _authChallengeTimeout = authChallengeTimeout,
+       _reconnectDelays =
+           reconnectDelays ??
+           const [
+             Duration(seconds: 1),
+             Duration(seconds: 2),
+             Duration(seconds: 5),
+             Duration(seconds: 10),
+             Duration(seconds: 30),
+             Duration(seconds: 60),
+           ];
 
   Future<void> connect(String myId, {String? fcmToken, String? handle}) async {
-    _fcmToken = fcmToken;
+    if (fcmToken != null) {
+      _fcmToken = fcmToken;
+    }
     _myId = myId;
     _myHandle = handle;
     _registerSent = false;
@@ -80,6 +104,15 @@ class SignalingService {
 
     _authChallengeTimer?.cancel();
     _channel = _channelFactory(Uri.parse(signalingUrl));
+    unawaited(
+      _channel!.ready
+          .then((_) {
+            if (connectionGeneration == _connectionGeneration) {
+              StartupLatency.mark('websocket_open');
+            }
+          })
+          .catchError((_) {}),
+    );
     _channel!.stream.listen(
       (data) {
         if (connectionGeneration != _connectionGeneration) return;
@@ -113,8 +146,15 @@ class SignalingService {
       if (connectionGeneration != _connectionGeneration || _registerSent) {
         return;
       }
-      print('Signaling auth challenge timeout; continuing legacy mode');
-      _sendRegister(connectionGeneration);
+      print(
+        'Signaling auth challenge timeout generation=$connectionGeneration',
+      );
+      unawaited(
+        _resetActiveConnection(
+          reason: 'auth_challenge_timeout',
+          connectionGeneration: connectionGeneration,
+        ),
+      );
     });
   }
 
@@ -125,6 +165,15 @@ class SignalingService {
     final myId = _myId;
     if (myId == null) return;
     _registerSent = true;
+    StartupLatency.mark('register', data: {'fcmToken': _fcmToken != null});
+    _send({'type': 'register', 'id': myId, 'fcmToken': _fcmToken});
+  }
+
+  void updateFcmToken(String? fcmToken) {
+    if (fcmToken == null || fcmToken.isEmpty) return;
+    _fcmToken = fcmToken;
+    final myId = _myId;
+    if (!_registered || myId == null) return;
     _send({'type': 'register', 'id': myId, 'fcmToken': _fcmToken});
   }
 
@@ -132,11 +181,15 @@ class SignalingService {
   void _scheduleReconnect() {
     _reconnectTimer?.cancel();
     if (_myId == null) return;
-    final delays = [1, 2, 5, 10, 30, 60];
-    final delaySecs = delays[_reconnectAttempt.clamp(0, delays.length - 1)];
+    final reconnectIndex = _reconnectAttempt
+        .clamp(0, _reconnectDelays.length - 1)
+        .toInt();
+    final delay = _reconnectDelays[reconnectIndex];
     _reconnectAttempt++;
-    print('Signaling reconnect in ${delaySecs}s (attempt $_reconnectAttempt)');
-    _reconnectTimer = Timer(Duration(seconds: delaySecs), () async {
+    print(
+      'Signaling reconnect in ${delay.inMilliseconds}ms (attempt $_reconnectAttempt)',
+    );
+    _reconnectTimer = Timer(delay, () async {
       if (_myId != null) {
         print('Signaling reconnecting...');
         await connect(_myId!, fcmToken: _fcmToken, handle: _myHandle);
@@ -150,11 +203,13 @@ class SignalingService {
   ) async {
     switch (msg['type']) {
       case 'auth_challenge':
+        StartupLatency.mark('auth_challenge');
         await _handleAuthChallenge(msg, connectionGeneration);
         break;
 
       case 'auth_ok':
         _authChallengeTimer?.cancel();
+        StartupLatency.mark('auth_ok');
         print('Signaling auth_ok');
         if (!_authErrorReceived) {
           _sendRegister(connectionGeneration);
@@ -162,13 +217,33 @@ class SignalingService {
         break;
 
       case 'auth_error':
+      case 'auth_failed':
         _authChallengeTimer?.cancel();
         _authErrorReceived = true;
-        final reason = msg['reason']?.toString() ?? 'unknown';
-        print('Signaling auth_error $reason');
+        final code = _safeServerErrorCode(msg);
+        print(
+          'Signaling ${msg['type']} $code generation=$connectionGeneration',
+        );
+        await _resetActiveConnection(
+          reason: '${msg['type']}:$code',
+          connectionGeneration: connectionGeneration,
+        );
+        break;
+
+      case 'register_error':
+        _authChallengeTimer?.cancel();
+        final code = _safeServerErrorCode(msg);
+        print(
+          'Signaling register_error $code generation=$connectionGeneration',
+        );
+        await _resetActiveConnection(
+          reason: 'register_error:$code',
+          connectionGeneration: connectionGeneration,
+        );
         break;
 
       case 'registered':
+        StartupLatency.mark('registered');
         print('Registered as: ${msg['id']}');
         _registered = true;
         _reconnectAttempt = 0;
@@ -222,6 +297,10 @@ class SignalingService {
             _rejectStaleCallEvent('ice', callId);
             break;
           }
+          if (_isSessionExpired(session)) {
+            unawaited(_handleActiveCallTimeout(callId, source: 'local_ice'));
+            break;
+          }
         } else if (session != null && session.peerId == fromId) {
           _rejectStaleCallEvent('ice', null);
           break;
@@ -245,23 +324,57 @@ class SignalingService {
         onPeerOffline?.call(id);
         break;
 
+      case 'call_offer_accepted':
+        {
+          final callId = msg['callId'] as String?;
+          final session = _activeCall;
+          if (callId == null ||
+              session == null ||
+              session.callId != callId ||
+              !session.isRingingOrConnecting) {
+            _rejectStaleCallEvent('call_offer_accepted', callId);
+            break;
+          }
+          session.createdAt = _dateTimeFromServerMillis(msg['createdAt']);
+          session.expiresAt = _dateTimeFromServerMillis(msg['expiresAt']);
+          if (session.expiresAt == null) {
+            _rejectStaleCallEvent('call_offer_accepted', callId);
+            await _cleanupActiveCall(reason: 'missing_call_deadline');
+            break;
+          }
+          _armActiveCallDeadline(session);
+          break;
+        }
+
       case 'call_offer':
+        StartupLatency.mark('pending_call_replay');
         final fromId = msg['from'] as String;
         final callId = msg['callId'] as String?;
         if (callId == null) {
           _rejectStaleCallEvent('call_offer', null);
           break;
         }
-        if (_activeCall != null && _activeCall!.callId != callId) {
+        final existingCall = _activeCall;
+        if (existingCall != null) {
+          if (existingCall.callId != callId) {
+            _rejectStaleCallEvent('call_offer', callId);
+          } else {
+            print('[CALL] duplicate call_offer ignored callId=$callId');
+          }
+          break;
+        }
+        final createdAt = _dateTimeFromServerMillis(msg['createdAt']);
+        final expiresAt = _dateTimeFromServerMillis(msg['expiresAt']);
+        if (expiresAt == null) {
           _rejectStaleCallEvent('call_offer', callId);
           break;
         }
-        final expiresAt = msg['expiresAt'];
-        if (expiresAt is num &&
-            DateTime.now().millisecondsSinceEpoch > expiresAt) {
+        if (DateTime.now().isAfter(expiresAt) ||
+            DateTime.now().isAtSameMomentAs(expiresAt)) {
           print(
             '[CALL] expired call_offer rejected callId=$callId expiresAt=$expiresAt',
           );
+          onCallEnded?.call();
           break;
         }
         print('[CALL] offer received from $fromId callId=$callId');
@@ -275,8 +388,11 @@ class SignalingService {
           peerId: fromId,
           direction: CallSessionDirection.incoming,
           state: CallSessionState.incomingRinging,
+          createdAt: createdAt,
+          expiresAt: expiresAt,
           pendingOffer: offer,
         );
+        _armActiveCallDeadline(_activeCall!);
         print(
           '[CALL] signaling call_offer created session callId=$callId peer=$fromId',
         );
@@ -308,6 +424,8 @@ class SignalingService {
           );
           await _flushPendingCallIceCandidates(callId!, webrtc);
           _activeCall?.state = CallSessionState.active;
+          _activeCallDeadlineTimer?.cancel();
+          _activeCallDeadlineTimer = null;
           onCallAnswered?.call();
           break;
         }
@@ -324,16 +442,37 @@ class SignalingService {
           break;
         }
 
+      case 'call_timeout':
+        {
+          final callId = msg['callId'] as String?;
+          if (callId == null || _activeCall?.callId != callId) {
+            _rejectStaleCallEvent('call_timeout', callId);
+            break;
+          }
+          await _handleActiveCallTimeout(callId, source: 'server');
+          break;
+        }
+
       case 'error':
         final message = msg['message']?.toString() ?? 'Unknown error';
+        final code = msg['code']?.toString();
         print('Signaling server error: $message');
 
         final isPeerOffline =
             message.toLowerCase().contains('peer not found') ||
             message.toLowerCase().contains('offline');
+        final isCallExpired =
+            code == 'CALL_EXPIRED' || message.contains('CALL_EXPIRED');
 
         final session = _activeCall;
         if (session != null) {
+          if (isCallExpired) {
+            await _handleActiveCallTimeout(
+              session.callId,
+              source: 'server_error',
+            );
+            break;
+          }
           if (!session.isAnswered && isPeerOffline) {
             print('[CALL] non-fatal error while ringing: $message');
             break;
@@ -356,8 +495,13 @@ class SignalingService {
     final nonce = msg['nonce'];
     final serverTime = msg['server_time'];
     if (nonce is! String || (serverTime is! int && serverTime is! String)) {
-      print('Signaling auth identity missing; continuing legacy mode');
-      _sendRegister(connectionGeneration);
+      print(
+        'Signaling auth_challenge invalid generation=$connectionGeneration',
+      );
+      await _resetActiveConnection(
+        reason: 'invalid_auth_challenge',
+        connectionGeneration: connectionGeneration,
+      );
       return;
     }
 
@@ -366,8 +510,11 @@ class SignalingService {
       serverTime: serverTime,
     );
     if (response == null) {
-      print('Signaling auth identity missing; continuing legacy mode');
-      _sendRegister(connectionGeneration);
+      print('Signaling auth identity missing generation=$connectionGeneration');
+      await _resetActiveConnection(
+        reason: 'missing_auth_identity',
+        connectionGeneration: connectionGeneration,
+      );
       return;
     }
     if (connectionGeneration != _connectionGeneration || _authErrorReceived) {
@@ -380,7 +527,103 @@ class SignalingService {
       'pubkey': response.publicKey,
       'signature': response.signature,
     });
+    StartupLatency.mark('auth_response');
     print('Signaling auth_response sent');
+  }
+
+  String _safeServerErrorCode(Map<String, dynamic> msg) {
+    for (final key in const ['code', 'reason', 'message']) {
+      final value = msg[key];
+      if (value is String && value.isNotEmpty) {
+        return value.replaceAll(RegExp(r'[^A-Za-z0-9_.:-]'), '_');
+      }
+    }
+    return 'unknown';
+  }
+
+  DateTime? _dateTimeFromServerMillis(dynamic value) {
+    if (value is num) {
+      return DateTime.fromMillisecondsSinceEpoch(value.toInt());
+    }
+    if (value is String) {
+      final millis = int.tryParse(value);
+      if (millis != null) {
+        return DateTime.fromMillisecondsSinceEpoch(millis);
+      }
+    }
+    return null;
+  }
+
+  bool _isSessionExpired(CallSession session) {
+    final expiresAt = session.expiresAt;
+    if (expiresAt == null) return false;
+    final now = DateTime.now();
+    return now.isAfter(expiresAt) || now.isAtSameMomentAs(expiresAt);
+  }
+
+  void _armActiveCallDeadline(CallSession session) {
+    if (_activeCall?.callId != session.callId || session.expiresAt == null) {
+      return;
+    }
+    if (_activeCallDeadlineTimer != null) {
+      print('[CALL] deadline already armed callId=${session.callId}');
+      return;
+    }
+
+    final remaining = session.expiresAt!.difference(DateTime.now());
+    if (remaining <= Duration.zero) {
+      unawaited(
+        _handleActiveCallTimeout(session.callId, source: 'local_deadline'),
+      );
+      return;
+    }
+
+    print(
+      '[CALL] deadline armed callId=${session.callId} remainingMs=${remaining.inMilliseconds}',
+    );
+    _activeCallDeadlineTimer = Timer(remaining, () {
+      unawaited(
+        _handleActiveCallTimeout(session.callId, source: 'local_deadline'),
+      );
+    });
+  }
+
+  Future<void> _handleActiveCallTimeout(
+    String callId, {
+    required String source,
+  }) async {
+    final session = _activeCall;
+    if (session == null || session.callId != callId) {
+      _rejectStaleCallEvent('call_timeout', callId);
+      return;
+    }
+    if (session.isAnswered) {
+      print('[CALL] call_timeout ignored for answered call callId=$callId');
+      return;
+    }
+    print('[CALL] call timed out source=$source callId=$callId');
+    onCallTimedOut?.call(callId);
+    await _cleanupActiveCall(reason: 'call_timeout:$source');
+  }
+
+  Future<void> _resetActiveConnection({
+    required String reason,
+    required int connectionGeneration,
+  }) async {
+    if (connectionGeneration != _connectionGeneration) return;
+    print(
+      'Signaling resetting connection reason=$reason generation=$connectionGeneration',
+    );
+    _authChallengeTimer?.cancel();
+    _pingTimer?.cancel();
+    _registered = false;
+    _registerSent = false;
+    onConnectionStateChanged?.call(false);
+    final channel = _channel;
+    _channel = null;
+    _connectionGeneration++;
+    await channel?.sink.close();
+    _scheduleReconnect();
   }
 
   Future<WebRTCService> _getOrCreatePeer(
@@ -434,6 +677,15 @@ class SignalingService {
       };
       final session = _activeCall;
       if (session != null && session.peerId == peerId) {
+        if (_isSessionExpired(session)) {
+          unawaited(
+            _handleActiveCallTimeout(
+              session.callId,
+              source: 'local_ice_candidate',
+            ),
+          );
+          return;
+        }
         payload['callId'] = session.callId;
       }
       _send(payload);
@@ -569,6 +821,10 @@ class SignalingService {
       print('[CALL] accept blocked because no SDP offer');
       return false;
     }
+    if (_isSessionExpired(session)) {
+      await _handleActiveCallTimeout(session.callId, source: 'local_accept');
+      return false;
+    }
     final peerId = session.peerId;
     print('[CALL] acceptCall peer=$peerId');
     try {
@@ -582,6 +838,13 @@ class SignalingService {
         withAudio: true,
       );
       await _flushPendingCallIceCandidates(session.callId, webrtc);
+      if (_isSessionExpired(session)) {
+        await _handleActiveCallTimeout(
+          session.callId,
+          source: 'local_accept_answer',
+        );
+        return false;
+      }
       print('[CALL] sending answer to $peerId callId=${session.callId}');
       _send({
         'type': 'call_answer',
@@ -591,6 +854,8 @@ class SignalingService {
       });
       session.pendingOffer = null;
       session.state = CallSessionState.active;
+      _activeCallDeadlineTimer?.cancel();
+      _activeCallDeadlineTimer = null;
       return true;
     } catch (e) {
       print('Accept call failed for $peerId: $e');
@@ -655,10 +920,12 @@ class SignalingService {
       return;
     }
 
+    _activeCallDeadlineTimer?.cancel();
+    _activeCallDeadlineTimer = null;
     session.state = CallSessionState.ending;
     _activeCall = null;
     session.pendingOffer = null;
-    _pendingCallIceCandidates.remove(session.callId);
+    _pendingCallIceCandidates.clear();
     onCallEnded?.call();
 
     _activeCallCleanup = () async {
@@ -678,6 +945,8 @@ class SignalingService {
     _pingTimer?.cancel();
     _reconnectTimer?.cancel();
     _authChallengeTimer?.cancel();
+    _activeCallDeadlineTimer?.cancel();
+    _activeCallDeadlineTimer = null;
     _connectionGeneration++;
     unawaited(_cleanupActiveCall(reason: 'disconnect'));
     for (final peerId in List<String>.from(_peers.keys)) {
