@@ -54,5 +54,4 @@ key.properties
 server/signaling/serviceAccount.json
 android/key.properties
 *.jks
-Add-Content .gitignore "`nnode_modules/"
 node_modules/
