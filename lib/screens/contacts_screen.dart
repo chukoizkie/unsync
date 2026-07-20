@@ -18,6 +18,7 @@ import '../services/foreground_service.dart';
 import '../services/fcm_service.dart';
 import '../services/call_notification_service.dart';
 import '../services/message_notification_service.dart';
+import '../services/pairing_window_service.dart';
 import '../services/ringtone_service.dart';
 import '../services/biometric_service.dart';
 import '../services/profile_photo_service.dart';
@@ -690,6 +691,20 @@ class _ContactsScreenState extends State<ContactsScreen>
 
       _signaling.onPeerConnected = (peerId) async {
         _connectionNotifier.value = true;
+        // The handshake below carries display name, Signal prekey bundle and
+        // profile photo. SignalingService answers any inbound offer, so this
+        // fires for peers we have never heard of — knowing our peer id was
+        // enough to harvest all three. Introduce ourselves only to saved
+        // contacts, or to anyone while the user is actively pairing.
+        final isSavedContact = _realContacts.any((c) => c.peerId == peerId);
+        if (!PairingWindowService.mayIntroduceTo(
+          isSavedContact: isSavedContact,
+        )) {
+          debugPrint(
+            'Handshake withheld: unknown peer outside the pairing window',
+          );
+          return;
+        }
         await _signalInitFuture;
         if (!_signalService.isInitialized) {
           // Matches pre-change behavior: if Signal init failed, no handshake.
