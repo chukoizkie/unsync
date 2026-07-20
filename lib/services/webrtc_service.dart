@@ -1,6 +1,7 @@
 import 'dart:async';
 import 'dart:convert';
 import 'package:flutter_webrtc/flutter_webrtc.dart';
+import '../config.dart';
 
 class WebRTCService {
   RTCPeerConnection? _peerConnection;
@@ -22,15 +23,18 @@ class WebRTCService {
   // DHT message handler — set by SignalingService
   Function(Map<String, dynamic> msg)? onDhtMessage;
 
-  final Map<String, dynamic> _iceServers = {
+  static final Map<String, dynamic> _iceServers = {
     'iceServers': [
       {'urls': 'stun:stun.l.google.com:19302'},
       {'urls': 'stun:stun1.l.google.com:19302'},
-      {
-        'urls': 'turn:64.188.17.219:3478',
-        'username': 'unsync',
-        'credential': 'unsync123',
-      },
+      // Omitted unless a credential was supplied at build time. See
+      // UnsyncConfig for why this is no longer a source literal.
+      if (UnsyncConfig.hasTurnCredentials)
+        {
+          'urls': UnsyncConfig.turnUrl,
+          'username': UnsyncConfig.turnUsername,
+          'credential': UnsyncConfig.turnCredential,
+        },
     ]
   };
 
