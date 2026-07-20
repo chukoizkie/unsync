@@ -72,9 +72,7 @@ class _CallLogScreenState extends State<CallLogScreen> {
       case _Filter.all:
         return _all;
       case _Filter.missed:
-        return _all
-            .where((e) => e.outcome == CallOutcome.missed)
-            .toList(growable: false);
+        return _all.where((e) => e.isMissedCall).toList(growable: false);
       case _Filter.incoming:
         return _all
             .where((e) => e.direction == CallDirection.incoming)
@@ -286,12 +284,7 @@ class _CallLogRow extends StatelessWidget {
 
   static const _missedColor = Color(0xFFFF6B6B);
 
-  /// Only an unanswered *incoming* call is "missed". An outgoing call nobody
-  /// picked up is a no-answer — flagging it red would read as a bug now that
-  /// outgoing calls are actually logged.
-  bool get _isMissed =>
-      entry.outcome == CallOutcome.missed &&
-      entry.direction == CallDirection.incoming;
+  bool get _isMissed => entry.isMissedCall;
 
   @override
   Widget build(BuildContext context) {

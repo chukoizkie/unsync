@@ -117,6 +117,8 @@ void main() {
     expect(entry.duration, isNotNull);
   });
 
+  _missedCallSemantics();
+
   test('unanswered projection builds a log entry with no duration', () {
     final s = session(direction: CallSessionDirection.outgoing);
 
@@ -124,5 +126,60 @@ void main() {
 
     expect(entry.outcome, CallOutcome.missed);
     expect(entry.duration, isNull);
+  });
+}
+
+/// The Missed filter and the row styling each used to define "missed"
+/// separately, so a row reading "No answer" still appeared under Missed.
+void _missedCallSemantics() {
+  CallLogEntry entry({
+    required CallDirection direction,
+    required CallOutcome outcome,
+  }) {
+    return CallLogEntry(
+      peerId: 'peer',
+      name: 'Peer',
+      direction: direction,
+      outcome: outcome,
+      type: CallType.audio,
+      timestamp: DateTime.now(),
+      callId: 'call',
+      duration: outcome == CallOutcome.answered
+          ? const Duration(seconds: 5)
+          : null,
+    );
+  }
+
+  test('an unanswered incoming call is missed', () {
+    expect(
+      entry(
+        direction: CallDirection.incoming,
+        outcome: CallOutcome.missed,
+      ).isMissedCall,
+      isTrue,
+    );
+  });
+
+  test('an unanswered outgoing call is a no-answer, not missed', () {
+    expect(
+      entry(
+        direction: CallDirection.outgoing,
+        outcome: CallOutcome.missed,
+      ).isMissedCall,
+      isFalse,
+    );
+  });
+
+  test('declined and answered calls are never missed', () {
+    for (final direction in CallDirection.values) {
+      expect(
+        entry(direction: direction, outcome: CallOutcome.declined).isMissedCall,
+        isFalse,
+      );
+      expect(
+        entry(direction: direction, outcome: CallOutcome.answered).isMissedCall,
+        isFalse,
+      );
+    }
   });
 }
