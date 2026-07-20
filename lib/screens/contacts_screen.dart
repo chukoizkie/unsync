@@ -757,6 +757,7 @@ class _ContactsScreenState extends State<ContactsScreen>
 
   Widget _buildCallScreen(String contactName, bool isOutgoing) {
     bool isMuted = false;
+    bool isSpeakerOn = false;
     return StatefulBuilder(
       builder: (ctx, setS) => CallScreen(
         contactName: contactName,
@@ -765,6 +766,11 @@ class _ContactsScreenState extends State<ContactsScreen>
         onMuteTap: () {
           setS(() => isMuted = !isMuted);
           _signaling.setMicMuted(isMuted);
+        },
+        isSpeakerOn: isSpeakerOn,
+        onSpeakerTap: () {
+          setS(() => isSpeakerOn = !isSpeakerOn);
+          unawaited(_signaling.setSpeakerphone(isSpeakerOn).catchError((_) {}));
         },
         onHangUp: () => _signaling.endVoiceCall(),
         callAnsweredNotifier: _callAnsweredNotifier,

@@ -36,6 +36,7 @@ class _IncomingCallRecoveryScreenState
   bool _showIncomingCall = false;
   bool _showActiveCall = false;
   bool _isMuted = false;
+  bool _isSpeakerOn = false;
   bool _leaving = false;
   bool _handoffStarted = false;
 
@@ -150,6 +151,15 @@ class _IncomingCallRecoveryScreenState
         onMuteTap: () {
           setState(() => _isMuted = !_isMuted);
           _controller.signalingService.setMicMuted(_isMuted);
+        },
+        isSpeakerOn: _isSpeakerOn,
+        onSpeakerTap: () {
+          setState(() => _isSpeakerOn = !_isSpeakerOn);
+          unawaited(
+            _controller.signalingService
+                .setSpeakerphone(_isSpeakerOn)
+                .catchError((_) {}),
+          );
         },
         onHangUp: () => _controller.signalingService.endVoiceCall(),
         callAnsweredNotifier: _callAnsweredNotifier,

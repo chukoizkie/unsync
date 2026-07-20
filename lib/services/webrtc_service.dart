@@ -194,9 +194,21 @@ class WebRTCService {
     }
   }
 
+  bool _speakerOn = false;
+
+  bool get isSpeakerOn => _speakerOn;
+
+  /// Routes call audio to the loudspeaker or back to the earpiece. Remembered
+  /// so a route applied before the connection is established survives the
+  /// activation that runs when ICE reaches connected.
+  Future<void> setSpeakerphone(bool on) async {
+    _speakerOn = on;
+    await _activateAudioRoute();
+  }
+
   Future<void> _activateAudioRoute() async {
     try {
-      await Helper.setSpeakerphoneOn(false);
+      await Helper.setSpeakerphoneOn(_speakerOn);
     } catch (e) {
       print('Audio route activation failed: $e');
     }

@@ -15,6 +15,12 @@ class SignalingService {
   static const String signalingUrl = UnsyncConfig.signalingUrl;
   static const int _idleTimeoutSeconds = 120;
 
+  /// Client-side ring limit for an outgoing call, used until the server sends
+  /// `call_offer_accepted` with the authoritative deadline. Without it an
+  /// outgoing call whose acceptance never arrives rings forever: the session
+  /// is created with no expiresAt, so no deadline is ever armed.
+  static const Duration outgoingRingFallback = Duration(seconds: 60);
+
   WebSocketChannel? _channel;
   final IdentityService _identityService;
   final SignalingChannelFactory _channelFactory;
@@ -140,7 +146,13 @@ class SignalingService {
     _channel!.stream.listen(
       (data) {
         if (connectionGeneration != _connectionGeneration) return;
-        final msg = jsonDecode(data as String);
+        final Map<String, dynamic> msg;
+        try {
+          msg = jsonDecode(data as String) as Map<String, dynamic>;
+        } catch (e) {
+          print('Signaling dropped unparseable frame: $e');
+          return;
+        }
         _handleMessage(msg, connectionGeneration);
       },
       onError: (e) {
@@ -233,7 +245,20 @@ class SignalingService {
     });
   }
 
-  void _handleMessage(
+  void _handleMessage(Map<String, dynamic> msg, int connectionGeneration) async {
+    try {
+      await _dispatchMessage(msg, connectionGeneration);
+    } catch (e, stack) {
+      // The dispatcher indexes into server-supplied maps in a dozen places
+      // (msg['sdp']['sdp'], `as String` casts). Without this, one malformed
+      // frame throws inside the WebSocket listener as an unhandled async
+      // error. A bad frame should cost us that frame, not the connection.
+      print('Signaling message failed type=${msg['type']} error=$e');
+      print(stack);
+    }
+  }
+
+  Future<void> _dispatchMessage(
     Map<String, dynamic> msg,
     int connectionGeneration,
   ) async {
@@ -381,6 +406,11 @@ class SignalingService {
             await _cleanupActiveCall(reason: 'missing_call_deadline');
             break;
           }
+          // Swap the provisional outgoing-ring deadline for the server's
+          // authoritative one. _armActiveCallDeadline will not re-arm over a
+          // live timer, so it has to be cleared first.
+          _activeCallDeadlineTimer?.cancel();
+          _activeCallDeadlineTimer = null;
           _armActiveCallDeadline(session);
           break;
         }
@@ -773,6 +803,9 @@ class SignalingService {
 
   Future<void> _closePeer(String peerId) async {
     _idleTimers.remove(peerId)?.cancel();
+    // Candidates buffered for a peer that never completed a connection would
+    // otherwise accumulate for the life of the process.
+    _pendingIceCandidates.remove(peerId);
     final peer = _peers.remove(peerId);
     if (peer == null) return;
     await peer.dispose();
@@ -813,7 +846,10 @@ class SignalingService {
       peerId: peerId,
       direction: CallSessionDirection.outgoing,
       state: CallSessionState.outgoingPreparing,
+      // Provisional; replaced by the server's deadline on call_offer_accepted.
+      expiresAt: DateTime.now().add(outgoingRingFallback),
     );
+    _armActiveCallDeadline(_activeCall!);
     _idleTimers[peerId]?.cancel();
     try {
       final webrtc = await _getOrCreatePeer(peerId, sendInitialOffer: false);
@@ -850,6 +886,12 @@ class SignalingService {
     if (peerId != null) {
       _peers[peerId]?.setMicMuted(muted);
     }
+  }
+
+  Future<void> setSpeakerphone(bool on) async {
+    final peerId = _activeCall?.peerId;
+    if (peerId == null) return;
+    await _peers[peerId]?.setSpeakerphone(on);
   }
 
   Future<bool> acceptCall() async {
