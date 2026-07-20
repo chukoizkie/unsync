@@ -23,17 +23,38 @@ typedef StopRingtone = Future<void> Function();
 typedef ShowMissedCall = Future<void> Function(CallLaunchDetails launch);
 
 class IncomingCallFastStartController {
-  IncomingCallFastStartController({
-    required this.launch,
+  factory IncomingCallFastStartController({
+    required CallLaunchDetails launch,
     IdentityService? identityService,
     SignalingService? signalingService,
     StartRingtone? startRingtone,
     StopRingtone? stopRingtone,
     ShowMissedCall? showMissedCall,
     Duration replayTimeout = const Duration(seconds: 30),
-  }) : identityService = identityService ?? IdentityService(),
-       signalingService = signalingService ?? SignalingService(),
-       _startRingtone = startRingtone ?? RingtoneService.startRinging,
+  }) {
+    final resolvedIdentity = identityService ?? IdentityService();
+    return IncomingCallFastStartController._(
+      launch: launch,
+      identityService: resolvedIdentity,
+      signalingService:
+          signalingService ??
+          SignalingService(identityService: resolvedIdentity),
+      startRingtone: startRingtone,
+      stopRingtone: stopRingtone,
+      showMissedCall: showMissedCall,
+      replayTimeout: replayTimeout,
+    );
+  }
+
+  IncomingCallFastStartController._({
+    required this.launch,
+    required this.identityService,
+    required this.signalingService,
+    StartRingtone? startRingtone,
+    StopRingtone? stopRingtone,
+    ShowMissedCall? showMissedCall,
+    required Duration replayTimeout,
+  }) : _startRingtone = startRingtone ?? RingtoneService.startRinging,
        _stopRingtone = stopRingtone ?? RingtoneService.stopRinging,
        _showMissedCall = showMissedCall ?? _defaultShowMissedCall,
        _defaultReplayTimeout = replayTimeout,
@@ -56,6 +77,7 @@ class IncomingCallFastStartController {
   Timer? _timeout;
   bool _started = false;
   bool _missedShown = false;
+  bool _releasedForHandoff = false;
 
   Future<void> start() async {
     if (_started) return;
@@ -138,8 +160,15 @@ class IncomingCallFastStartController {
 
   Future<void> dispose() async {
     _timeout?.cancel();
-    signalingService.dispose();
+    if (!_releasedForHandoff) {
+      signalingService.dispose();
+    }
     state.dispose();
+  }
+
+  void releaseForHandoff() {
+    _releasedForHandoff = true;
+    _timeout?.cancel();
   }
 
   Future<void> _cancelCallNotification() async {

@@ -40,14 +40,14 @@ class _SplashScreenState extends State<SplashScreen> {
           context,
           MaterialPageRoute(
             builder: (_) =>
-                const BiometricScreen(destination: ContactsScreen()),
+                BiometricScreen(destination: ContactsScreen(identity: _identity)),
           ),
         );
         return;
       }
       Navigator.pushReplacement(
         context,
-        MaterialPageRoute(builder: (_) => const ContactsScreen()),
+        MaterialPageRoute(builder: (_) => ContactsScreen(identity: _identity)),
       );
     } else {
       Navigator.pushReplacement(

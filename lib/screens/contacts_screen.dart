@@ -31,7 +31,15 @@ import 'chat_screen.dart';
 import 'call_log_screen.dart';
 
 class ContactsScreen extends StatefulWidget {
-  const ContactsScreen({super.key});
+  const ContactsScreen({super.key, this.identity, this.signaling});
+
+  /// Optional pre-initialized identity (from SplashScreen) so boot doesn't
+  /// pay for a second IdentityService.initialize().
+  final IdentityService? identity;
+
+  /// Optional already-connected signaling service from the incoming-call
+  /// recovery path. Ownership transfers to this screen when supplied.
+  final SignalingService? signaling;
 
   @override
   State<ContactsScreen> createState() => _ContactsScreenState();
@@ -40,12 +48,15 @@ class ContactsScreen extends StatefulWidget {
 class _ContactsScreenState extends State<ContactsScreen>
     with WidgetsBindingObserver {
   int _selectedTab = 0;
-  final _signaling = SignalingService();
-  final _identity = IdentityService();
+  late final IdentityService _identity = widget.identity ?? IdentityService();
+  late final SignalingService _signaling =
+      widget.signaling ?? SignalingService(identityService: _identity);
   final _contactsService = ContactsService();
   final _messagesService = MessagesService();
   final _signalService = SignalService();
-  final _relayService = RelayService();
+  late final RelayService _relayService = RelayService(
+    identityService: _identity,
+  );
   final _profilePhotoService = ProfilePhotoService();
 
   bool _connected = false;
@@ -65,6 +76,7 @@ class _ContactsScreenState extends State<ContactsScreen>
   String? _pendingNotificationCallerId;
   AppLifecycleState _lifecycleState = AppLifecycleState.resumed;
   bool _initialCallLaunchChecked = false;
+  Future<void>? _signalInitFuture; // Signal init runs concurrently with connect
 
   // ── call-log wiring ──
   final _callLog = CallLogStore();
@@ -75,11 +87,21 @@ class _ContactsScreenState extends State<ContactsScreen>
   String? _logName; // display name captured for the active call
 
   bool get _isAppVisible => _lifecycleState == AppLifecycleState.resumed;
+  bool get _hasReusableIdentity =>
+      widget.identity != null && (_identity.peerId?.isNotEmpty ?? false);
+  bool get _hasReusableSignaling =>
+      widget.signaling != null && widget.signaling!.isConnected;
 
   @override
   void initState() {
     super.initState();
-    StartupLatency.mark('contacts_screen_init');
+    StartupLatency.mark(
+      'contacts_screen_init',
+      data: {
+        'reusedIdentity': _hasReusableIdentity,
+        'reusedSignaling': _hasReusableSignaling,
+      },
+    );
     WidgetsBinding.instance.addObserver(this);
     _lifecycleState =
         WidgetsBinding.instance.lifecycleState ?? AppLifecycleState.resumed;
@@ -337,12 +359,19 @@ class _ContactsScreenState extends State<ContactsScreen>
   Future<void> _connect() async {
     try {
       ForegroundServiceManager.init();
-      StartupLatency.mark('identity_load_start');
-      await _identity.initialize();
-      StartupLatency.mark(
-        'identity_load_end',
-        data: {'peerId': _identity.peerId ?? 'missing'},
-      );
+      if (_hasReusableIdentity) {
+        StartupLatency.mark(
+          'identity_load_end',
+          data: {'peerId': _identity.peerId ?? 'missing', 'reused': true},
+        );
+      } else {
+        StartupLatency.mark('identity_load_start');
+        await _identity.initialize();
+        StartupLatency.mark(
+          'identity_load_end',
+          data: {'peerId': _identity.peerId ?? 'missing', 'reused': false},
+        );
+      }
       final id =
           _identity.peerId ?? DateTime.now().millisecondsSinceEpoch.toString();
 
@@ -354,7 +383,12 @@ class _ContactsScreenState extends State<ContactsScreen>
       if (initialCallerId != null) {
         _handleCallNotificationLaunch(initialCallerId);
       }
-      await Future.microtask(() => _signalService.initialize());
+      // Signal init (secure-storage reads + crypto) no longer blocks the
+      // signaling connect; handlers that need it await _signalInitFuture.
+      _signalInitFuture = Future.microtask(() => _signalService.initialize())
+          .catchError((e) {
+            debugPrint('Signal init failed: $e');
+          });
 
       // ── notification tap handlers ──────────────────────────────────────────
       MessageNotificationService.onNotificationTapped = (peerId) async {
@@ -537,8 +571,14 @@ class _ContactsScreenState extends State<ContactsScreen>
         _remoteStreamNotifier.value = stream;
       };
 
-      StartupLatency.mark('signaling_connect_start');
-      await _signaling.connect(id, handle: _identity.displayName);
+      if (_hasReusableSignaling) {
+        FCMService.setSignalingConnected(true);
+        _connectionNotifier.value = true;
+        if (mounted) setState(() => _connected = true);
+      } else {
+        StartupLatency.mark('signaling_connect_start');
+        await _signaling.connect(id, handle: _identity.displayName);
+      }
       if (initialCallerId == null) {
         _clearStaleIncomingCallNotificationIfIdle();
       }
@@ -550,6 +590,7 @@ class _ContactsScreenState extends State<ContactsScreen>
 
       Future.delayed(const Duration(seconds: 2), () async {
         try {
+          await _signalInitFuture;
           final bundle = await _signalService.buildPreKeyBundle();
           _relayService.uploadBundle(id, {
             'registrationId': bundle.getRegistrationId(),
@@ -568,6 +609,7 @@ class _ContactsScreenState extends State<ContactsScreen>
       });
 
       _relayService.onQueuedMessage = (from, payload) async {
+        await _signalInitFuture;
         String text = payload;
         if (_signalService.isInitialized) {
           try {
@@ -644,6 +686,7 @@ class _ContactsScreenState extends State<ContactsScreen>
 
       // ── message handling ───────────────────────────────────────────────────
       _signaling.onMessageReceived = (peerId, msg) async {
+        await _signalInitFuture;
         try {
           final parsed = jsonDecode(msg);
           if (parsed['type'] == 'handshake') {
@@ -736,6 +779,12 @@ class _ContactsScreenState extends State<ContactsScreen>
 
       _signaling.onPeerConnected = (peerId) async {
         _connectionNotifier.value = true;
+        await _signalInitFuture;
+        if (!_signalService.isInitialized) {
+          // Matches pre-change behavior: if Signal init failed, no handshake.
+          debugPrint('Handshake skipped: Signal service not initialized');
+          return;
+        }
         final myName = _identity.displayName ?? 'Unknown';
         final myId2 = _identity.peerId ?? '';
         final bundle = await _signalService.buildPreKeyBundle();

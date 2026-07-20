@@ -35,6 +35,7 @@ class _IncomingCallRecoveryScreenState
   bool _showActiveCall = false;
   bool _isMuted = false;
   bool _leaving = false;
+  bool _handoffStarted = false;
 
   @override
   void initState() {
@@ -68,9 +69,7 @@ class _IncomingCallRecoveryScreenState
     }
     if (phase == IncomingCallFastStartPhase.expired && mounted) {
       unawaited(CallNotificationService.cancel().catchError((_) {}));
-      Navigator.of(context).pushReplacement(
-        MaterialPageRoute<void>(builder: (_) => const ContactsScreen()),
-      );
+      _handoffToContacts();
     }
   }
 
@@ -82,8 +81,22 @@ class _IncomingCallRecoveryScreenState
     _callAnsweredNotifier.value = false;
     _remoteStreamNotifier.value = null;
     if (!mounted) return;
+    _handoffToContacts();
+  }
+
+  void _handoffToContacts() {
+    if (_handoffStarted) return;
+    _handoffStarted = true;
+    _leaving = true;
+    _controller.releaseForHandoff();
+    StartupLatency.mark('recovery_handoff_complete');
     Navigator.of(context).pushAndRemoveUntil(
-      MaterialPageRoute<void>(builder: (_) => const ContactsScreen()),
+      MaterialPageRoute<void>(
+        builder: (_) => ContactsScreen(
+          identity: _controller.identityService,
+          signaling: _controller.signalingService,
+        ),
+      ),
       (route) => false,
     );
   }
