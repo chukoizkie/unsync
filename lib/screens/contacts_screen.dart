@@ -556,11 +556,14 @@ class _ContactsScreenState extends State<ContactsScreen>
               ),
             )
             .displayName;
-        MessageNotificationService.showMessageNotification(
-          senderName,
-          text,
-          peerId: from,
-        );
+        // Don't notify for the conversation already on screen.
+        if (_openChatPeerId != from) {
+          MessageNotificationService.showMessageNotification(
+            senderName,
+            text,
+            peerId: from,
+          );
+        }
       };
 
       // ── killed-state notification resume ───────────────────────────────────
@@ -583,7 +586,10 @@ class _ContactsScreenState extends State<ContactsScreen>
         final pendingFromId = prefs.getString('pending_message_wake');
         if (pendingFromId != null && pendingFromId.isNotEmpty) {
           await prefs.remove('pending_message_wake');
-          await MessageNotificationService.cancel();
+          // Only this conversation's notification. cancel() is cancelAll(),
+          // which would also tear down an incoming-call notification that
+          // happened to arrive while we were resuming.
+          await MessageNotificationService.cancelForPeer(pendingFromId);
           for (int i = 0; i < 30; i++) {
             await Future.delayed(const Duration(milliseconds: 500));
             if (_signaling.myId != null && _realContacts.isNotEmpty) break;
@@ -679,11 +685,14 @@ class _ContactsScreenState extends State<ContactsScreen>
                     ),
                   )
                   .displayName;
-              MessageNotificationService.showMessageNotification(
-                senderName,
-                plaintext,
-                peerId: peerId,
-              );
+              // Don't notify for the conversation already on screen.
+              if (_openChatPeerId != peerId) {
+                MessageNotificationService.showMessageNotification(
+                  senderName,
+                  plaintext,
+                  peerId: peerId,
+                );
+              }
             });
           }
         });

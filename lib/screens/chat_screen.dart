@@ -1,3 +1,4 @@
+import 'dart:async';
 import 'dart:io';
 
 import 'package:flutter/material.dart';
@@ -6,6 +7,7 @@ import '../models/contact.dart';
 import '../models/message.dart';
 import '../services/signaling_service.dart';
 import '../services/relay_service.dart';
+import '../services/message_notification_service.dart';
 import '../services/messages_service.dart';
 import '../services/signal_service.dart';
 import 'call_screen.dart';
@@ -59,6 +61,14 @@ class _ChatScreenState extends State<ChatScreen> {
   @override
   void initState() {
     super.initState();
+    // Opening the conversation is the user reading it — drop its notification.
+    // Done here rather than at the call sites so every route into a chat is
+    // covered: contact tap, notification tap, and the killed-state resume.
+    unawaited(
+      MessageNotificationService.cancelForPeer(
+        widget.contact.id,
+      ).catchError((_) {}),
+    );
     widget.messagesService?.getMessages(widget.contact.id).then((stored) {
       if (mounted && stored.isNotEmpty) {
         setState(() {
