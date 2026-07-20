@@ -15,11 +15,11 @@ class SignalingService {
   static const String signalingUrl = UnsyncConfig.signalingUrl;
   static const int _idleTimeoutSeconds = 120;
 
-  /// Client-side ring limit for an outgoing call, used until the server sends
-  /// `call_offer_accepted` with the authoritative deadline. Without it an
-  /// outgoing call whose acceptance never arrives rings forever: the session
-  /// is created with no expiresAt, so no deadline is ever armed.
-  static const Duration outgoingRingFallback = Duration(seconds: 60);
+  /// Hard ring limit. An unanswered call is dropped this long after it starts,
+  /// on both legs, regardless of the longer deadline the server allows
+  /// (PENDING_CALL_TTL_MS, currently 60s). The server deadline still applies
+  /// when it is the shorter of the two, so this only ever tightens.
+  static const Duration maxRingDuration = Duration(seconds: 30);
 
   WebSocketChannel? _channel;
   final IdentityService _identityService;
@@ -203,7 +203,21 @@ class SignalingService {
     _registerSent = true;
     StartupLatency.mark('register', data: {'fcmToken': _fcmToken != null});
     _sentFcmToken = _fcmToken;
-    _send({'type': 'register', 'id': myId, 'fcmToken': _fcmToken});
+    _send(_registerPayload(myId));
+  }
+
+  /// The key is omitted when we have no token. Sending an explicit null fails
+  /// the server's `msg.fcmToken !== undefined && !isNonEmptyString(...)` check
+  /// and rejects the whole register — which is why the cold-start recovery
+  /// path, the one connection that has no token yet, never registered and so
+  /// never received its pending call replay.
+  Map<String, dynamic> _registerPayload(String myId) {
+    final payload = <String, dynamic>{'type': 'register', 'id': myId};
+    final token = _fcmToken;
+    if (token != null && token.isNotEmpty) {
+      payload['fcmToken'] = token;
+    }
+    return payload;
   }
 
   void updateFcmToken(String? fcmToken) {
@@ -222,7 +236,7 @@ class SignalingService {
     if (!_registered || myId == null) return;
     if (_fcmToken == null || _fcmToken == _sentFcmToken) return;
     _sentFcmToken = _fcmToken;
-    _send({'type': 'register', 'id': myId, 'fcmToken': _fcmToken});
+    _send(_registerPayload(myId));
   }
 
   int _reconnectAttempt = 0;
@@ -400,15 +414,21 @@ class SignalingService {
             break;
           }
           session.createdAt = _dateTimeFromServerMillis(msg['createdAt']);
-          session.expiresAt = _dateTimeFromServerMillis(msg['expiresAt']);
-          if (session.expiresAt == null) {
+          final serverExpiresAt = _dateTimeFromServerMillis(msg['expiresAt']);
+          if (serverExpiresAt == null) {
             _rejectStaleCallEvent('call_offer_accepted', callId);
             await _cleanupActiveCall(reason: 'missing_call_deadline');
             break;
           }
-          // Swap the provisional outgoing-ring deadline for the server's
-          // authoritative one. _armActiveCallDeadline will not re-arm over a
-          // live timer, so it has to be cleared first.
+          // Keep whichever deadline comes first. session.expiresAt is already
+          // the local ring cap set when the call started, and the server's is
+          // longer, so accepting it wholesale would ring past the cap.
+          session.expiresAt = _earlierDeadline(
+            session.expiresAt,
+            serverExpiresAt,
+          );
+          // _armActiveCallDeadline will not re-arm over a live timer, so the
+          // provisional one has to be cleared first.
           _activeCallDeadlineTimer?.cancel();
           _activeCallDeadlineTimer = null;
           _armActiveCallDeadline(session);
@@ -452,13 +472,18 @@ class SignalingService {
           msg['sdp']['type'],
         );
         _pendingCallIceCandidates.removeWhere((id, _) => id != callId);
+        // Stop ringing at the cap even if the server would allow longer. Timed
+        // from the caller's start when the server told us (a cold-start offer
+        // can arrive seconds late, and ringing past the caller's own cap just
+        // means answering into a call they already dropped).
+        final ringCap = (createdAt ?? DateTime.now()).add(maxRingDuration);
         _activeCall = CallSession(
           callId: callId,
           peerId: fromId,
           direction: CallSessionDirection.incoming,
           state: CallSessionState.incomingRinging,
           createdAt: createdAt,
-          expiresAt: expiresAt,
+          expiresAt: _earlierDeadline(expiresAt, ringCap),
           pendingOffer: offer,
         );
         _armActiveCallDeadline(_activeCall!);
@@ -532,6 +557,25 @@ class SignalingService {
             message.toLowerCase().contains('offline');
         final isCallExpired =
             code == 'CALL_EXPIRED' || message.contains('CALL_EXPIRED');
+
+        // An error arriving after register but before `registered` blocked the
+        // registration. Previously this was ignored entirely, leaving the
+        // socket open but unregistered forever: no replay, no retry, no
+        // reconnect — the cold-start recovery screen just span until it timed
+        // out. Drop a token the server refused so the retry omits it, then
+        // reset so the normal backoff reconnect applies.
+        if (_registerSent && !_registered) {
+          if (message.toLowerCase().contains('fcm token')) {
+            print('[CALL] server rejected FCM token; retrying without it');
+            _fcmToken = null;
+            _sentFcmToken = null;
+          }
+          await _resetActiveConnection(
+            reason: 'register_blocked:$message',
+            connectionGeneration: connectionGeneration,
+          );
+          break;
+        }
 
         final session = _activeCall;
         if (session != null) {
@@ -623,6 +667,14 @@ class SignalingService {
     return null;
   }
 
+  /// Earliest of the two deadlines. The server's is authoritative for when it
+  /// will drop the pending call; ours caps how long we are willing to ring.
+  DateTime? _earlierDeadline(DateTime? a, DateTime? b) {
+    if (a == null) return b;
+    if (b == null) return a;
+    return a.isBefore(b) ? a : b;
+  }
+
   bool _isSessionExpired(CallSession session) {
     final expiresAt = session.expiresAt;
     if (expiresAt == null) return false;
@@ -671,6 +723,13 @@ class SignalingService {
       return;
     }
     print('[CALL] call timed out source=$source callId=$callId');
+    // A locally-decided timeout has to be announced. The server holds the
+    // pending call for its own, longer TTL, so without this the peer keeps
+    // ringing — and an offline peer could still be woken by FCM for a call
+    // this device already gave up on.
+    if (source.startsWith('local')) {
+      _send({'type': 'call_end', 'to': session.peerId, 'callId': callId});
+    }
     onCallTimedOut?.call(callId);
     await _cleanupActiveCall(reason: 'call_timeout:$source');
   }
@@ -847,7 +906,7 @@ class SignalingService {
       direction: CallSessionDirection.outgoing,
       state: CallSessionState.outgoingPreparing,
       // Provisional; replaced by the server's deadline on call_offer_accepted.
-      expiresAt: DateTime.now().add(outgoingRingFallback),
+      expiresAt: DateTime.now().add(maxRingDuration),
     );
     _armActiveCallDeadline(_activeCall!);
     _idleTimers[peerId]?.cancel();

@@ -232,7 +232,7 @@ void main() {
     expect(
       channel.sink.messages.where((message) => message['type'] == 'register'),
       [
-        {'type': 'register', 'id': 'mercury-peer', 'fcmToken': null},
+        {'type': 'register', 'id': 'mercury-peer'},
         {
           'type': 'register',
           'id': 'mercury-peer',
@@ -270,7 +270,7 @@ void main() {
     expect(
       channel.sink.messages.where((message) => message['type'] == 'register'),
       [
-        {'type': 'register', 'id': 'mercury-peer', 'fcmToken': null},
+        {'type': 'register', 'id': 'mercury-peer'},
       ],
     );
 
@@ -280,7 +280,7 @@ void main() {
     expect(
       channel.sink.messages.where((message) => message['type'] == 'register'),
       [
-        {'type': 'register', 'id': 'mercury-peer', 'fcmToken': null},
+        {'type': 'register', 'id': 'mercury-peer'},
         {
           'type': 'register',
           'id': 'mercury-peer',
@@ -288,6 +288,72 @@ void main() {
         },
       ],
     );
+
+    service.disconnect();
+    await harness.close();
+  });
+
+  test('register omits fcmToken entirely when there is none', () async {
+    final harness = _SocketHarness();
+    final service = _signalingService(
+      harness: harness,
+      identityResponse: const MeshAuthResponse(
+        peerId: 'mercury-peer',
+        publicKey: 'public-key',
+        signature: 'signature',
+      ),
+    );
+
+    await service.connect('mercury-peer');
+    final channel = harness.single;
+    await _authenticate(channel);
+
+    // The server rejects an explicit null:
+    //   msg.fcmToken !== undefined && !isNonEmptyString(msg.fcmToken)
+    // which failed the whole register. The cold-start recovery path is the
+    // one connection with no token, so it never registered and never got its
+    // pending call replayed.
+    final register = channel.sink.messages.firstWhere(
+      (message) => message['type'] == 'register',
+    );
+    expect(register.containsKey('fcmToken'), isFalse);
+    expect(register, {'type': 'register', 'id': 'mercury-peer'});
+
+    service.disconnect();
+    await harness.close();
+  });
+
+  test('an error before registered resets the connection instead of hanging',
+      () async {
+    final harness = _SocketHarness();
+    final service = _signalingService(
+      harness: harness,
+      identityResponse: const MeshAuthResponse(
+        peerId: 'mercury-peer',
+        publicKey: 'public-key',
+        signature: 'signature',
+      ),
+    );
+
+    await service.connect('mercury-peer', fcmToken: 'bad-token');
+    final first = harness.single;
+    await _authenticate(first);
+
+    first.sendServer({'type': 'error', 'message': 'Invalid FCM token'});
+    await _waitForReconnect(harness);
+
+    // Previously this error was ignored: the socket stayed open, unregistered,
+    // with no replay and no retry.
+    expect(first.sink.closed, isTrue);
+    expect(service.isConnected, isFalse);
+
+    // The refused token is dropped so the retry can register without it.
+    final retry = harness.channels.last;
+    await _authenticate(retry);
+    final register = retry.sink.messages.firstWhere(
+      (message) => message['type'] == 'register',
+    );
+    expect(register.containsKey('fcmToken'), isFalse);
 
     service.disconnect();
     await harness.close();
