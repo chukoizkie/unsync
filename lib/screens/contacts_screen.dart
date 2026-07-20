@@ -462,9 +462,13 @@ class _ContactsScreenState extends State<ContactsScreen>
       };
 
       _signaling.onPeerOffline = (peerId) {
-        FCMService.setSignalingConnected(false);
-        _connectionNotifier.value = false;
-        if (mounted) setState(() => _connected = false);
+        // Deliberately does not touch global connection state. `peer_offline`
+        // means one peer is unreachable; our own signaling socket is still up.
+        // Clearing _connected here pinned the UI to "connecting to mesh..."
+        // and, worse, told FCMService we were disconnected — so every later
+        // wake-up was mislabelled. SignalingService has already closed the
+        // peer connection by the time this fires.
+        print('[CALL] peer offline peerId=$peerId (signaling still connected)');
       };
 
       _signaling.onIncomingCall = (peerId) async {
@@ -604,7 +608,7 @@ class _ContactsScreenState extends State<ContactsScreen>
             ),
           });
         } catch (e) {
-          print('Bundle upload failed: \$e');
+          print('Bundle upload failed: $e');
         }
       });
 
@@ -624,7 +628,7 @@ class _ContactsScreenState extends State<ContactsScreen>
             }
             text = await _signalService.decrypt(from, payload);
           } catch (e) {
-            print('Relay decrypt error: \$e');
+            print('Relay decrypt error: $e');
           }
         }
         await _messagesService.addMessage(from, text, false);
@@ -733,7 +737,7 @@ class _ContactsScreenState extends State<ContactsScreen>
                 );
                 await _signalService.processPreKeyBundle(hid, bundle);
               } catch (e) {
-                print('Signal bundle error: \$e');
+                print('Signal bundle error: $e');
               }
             }
             return;
@@ -745,7 +749,7 @@ class _ContactsScreenState extends State<ContactsScreen>
           try {
             plaintext = await _signalService.decrypt(peerId, msg);
           } catch (e) {
-            print('Decrypt error: \$e');
+            print('Decrypt error: $e');
           }
         }
         _messagesService.addMessage(peerId, plaintext, false).then((_) {
@@ -822,7 +826,7 @@ class _ContactsScreenState extends State<ContactsScreen>
         }
       });
     } catch (e, stack) {
-      print('Connect error: \$e');
+      print('Connect error: $e');
       print(stack);
     }
   }
@@ -1371,7 +1375,7 @@ class _ContactTile extends StatelessWidget {
                     ),
                     child: Center(
                       child: Text(
-                        '\${contact.unread}',
+                        '${contact.unread}',
                         style: const TextStyle(
                           color: kBg,
                           fontSize: 11,

@@ -244,6 +244,89 @@ void main() {
     service.disconnect();
     await harness.close();
   });
+
+  test('FCM token arriving before registered is flushed once registered '
+      'confirms', () async {
+    final harness = _SocketHarness();
+    final service = _signalingService(
+      harness: harness,
+      identityResponse: const MeshAuthResponse(
+        peerId: 'mercury-peer',
+        publicKey: 'public-key',
+        signature: 'signature',
+      ),
+    );
+
+    await service.connect('mercury-peer');
+    final channel = harness.single;
+    await _authenticate(channel);
+
+    // Token resolves in the window between `register` and `registered` — the
+    // real race, since FCMService.initialize() runs concurrently with connect.
+    service.updateFcmToken('late-fcm-token');
+    await pumpEventQueue();
+
+    // Nothing to send yet: the server has not confirmed registration.
+    expect(
+      channel.sink.messages.where((message) => message['type'] == 'register'),
+      [
+        {'type': 'register', 'id': 'mercury-peer', 'fcmToken': null},
+      ],
+    );
+
+    channel.sendServer({'type': 'registered', 'id': 'mercury-peer'});
+    await pumpEventQueue();
+
+    expect(
+      channel.sink.messages.where((message) => message['type'] == 'register'),
+      [
+        {'type': 'register', 'id': 'mercury-peer', 'fcmToken': null},
+        {
+          'type': 'register',
+          'id': 'mercury-peer',
+          'fcmToken': 'late-fcm-token',
+        },
+      ],
+    );
+
+    service.disconnect();
+    await harness.close();
+  });
+
+  test('registered does not re-send a token the server already has', () async {
+    final harness = _SocketHarness();
+    final service = _signalingService(
+      harness: harness,
+      identityResponse: const MeshAuthResponse(
+        peerId: 'mercury-peer',
+        publicKey: 'public-key',
+        signature: 'signature',
+      ),
+    );
+
+    service.updateFcmToken('known-fcm-token');
+    await service.connect('mercury-peer');
+    final channel = harness.single;
+    await _authenticate(channel);
+    channel.sendServer({'type': 'registered', 'id': 'mercury-peer'});
+    await pumpEventQueue();
+
+    // The token was already carried by the initial register, so the flush on
+    // `registered` must be a no-op rather than a duplicate registration.
+    expect(
+      channel.sink.messages.where((message) => message['type'] == 'register'),
+      [
+        {
+          'type': 'register',
+          'id': 'mercury-peer',
+          'fcmToken': 'known-fcm-token',
+        },
+      ],
+    );
+
+    service.disconnect();
+    await harness.close();
+  });
 }
 
 SignalingService _signalingService({

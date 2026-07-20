@@ -169,6 +169,16 @@ class IncomingCallFastStartController {
   void releaseForHandoff() {
     _releasedForHandoff = true;
     _timeout?.cancel();
+    // Ownership of the signaling service transfers to ContactsScreen, but its
+    // _connect() only reassigns these after several awaits. Until then these
+    // closures still point at this controller and at the recovery screen's
+    // notifiers — all about to be disposed. A call event landing in that
+    // window would write to a disposed ValueNotifier and throw inside the
+    // WebSocket listener, so detach them here rather than at dispose().
+    signalingService.onIncomingCall = null;
+    signalingService.onCallEnded = null;
+    signalingService.onCallAnswered = null;
+    signalingService.onRemoteStream = null;
   }
 
   Future<void> _cancelCallNotification() async {

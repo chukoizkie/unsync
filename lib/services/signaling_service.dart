@@ -40,6 +40,12 @@ class SignalingService {
   String? get myId => _myId;
   String? _fcmToken;
 
+  /// The token value carried by the most recent `register` we sent. Compared
+  /// against [_fcmToken] so a token that arrives mid-handshake is flushed once
+  /// the server confirms registration, instead of being stranded until the
+  /// next reconnect. The server only learns tokens via `register`.
+  String? _sentFcmToken;
+
   // DHT identity - set before connecting
   String? _myHandle;
 
@@ -103,6 +109,16 @@ class SignalingService {
     final connectionGeneration = ++_connectionGeneration;
 
     _authChallengeTimer?.cancel();
+    // Close any socket from a previous connect() on this instance. The
+    // generation bump above already fences its callbacks, but without an
+    // explicit close the old socket stays open and the server sees two live
+    // connections for one peer id. Reachable when ContactsScreen adopts a
+    // handed-off service that had not finished registering.
+    final previousChannel = _channel;
+    _channel = null;
+    if (previousChannel != null) {
+      unawaited(Future.sync(previousChannel.sink.close).catchError((_) {}));
+    }
     _channel = _channelFactory(Uri.parse(signalingUrl));
     unawaited(
       _channel!.ready
@@ -166,14 +182,26 @@ class SignalingService {
     if (myId == null) return;
     _registerSent = true;
     StartupLatency.mark('register', data: {'fcmToken': _fcmToken != null});
+    _sentFcmToken = _fcmToken;
     _send({'type': 'register', 'id': myId, 'fcmToken': _fcmToken});
   }
 
   void updateFcmToken(String? fcmToken) {
     if (fcmToken == null || fcmToken.isEmpty) return;
     _fcmToken = fcmToken;
+    // Not registered yet: keep the token and let the `registered` handler
+    // flush it. Dropping it here used to strand the token on the client until
+    // some later reconnect happened to race the other way, leaving the peer
+    // unreachable for FCM wake-ups.
+    _flushFcmTokenIfStale();
+  }
+
+  /// Re-sends `register` when the server's view of our token is behind ours.
+  void _flushFcmTokenIfStale() {
     final myId = _myId;
     if (!_registered || myId == null) return;
+    if (_fcmToken == null || _fcmToken == _sentFcmToken) return;
+    _sentFcmToken = _fcmToken;
     _send({'type': 'register', 'id': myId, 'fcmToken': _fcmToken});
   }
 
@@ -252,6 +280,9 @@ class SignalingService {
         _pingTimer = Timer.periodic(const Duration(seconds: 30), (_) {
           _send({'type': 'ping'});
         });
+        // A token that arrived between `register` and `registered` was held
+        // back; send it now that the server will accept it.
+        _flushFcmTokenIfStale();
         break;
 
       case 'knock':
@@ -814,6 +845,14 @@ class SignalingService {
   }
 
   Future<bool> acceptCall() async {
+    if (!_registered) {
+      // _send is a silent no-op on a dead socket, so without this guard we
+      // would build the answer, drop it, and still report success — leaving
+      // the callee on a live call screen the caller never sees answered.
+      // The session's deadline timer stays armed and will time it out.
+      print('[CALL] acceptCall blocked because signaling is disconnected');
+      return false;
+    }
     final session = _activeCall;
     if (session == null ||
         !session.isIncoming ||
