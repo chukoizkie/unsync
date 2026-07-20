@@ -155,16 +155,31 @@ class RelayService {
 
   Future<Map<String, dynamic>?> getBundle(String peerId) => fetchBundle(peerId);
 
-  void storeMessage(String to, String from, String encryptedPayload) {
+  Future<void> storeMessage(
+    String to,
+    String from,
+    String encryptedPayload,
+  ) async {
     if (!_connected) {
       print('Relay: not connected, cannot store');
       return;
     }
+    // Signaling authenticates wake requests against the *sender's* identity,
+    // so the relay cannot mint one — it can only forward what we sign. Without
+    // this the relay's wake ping is rejected with 400 and the recipient is
+    // never pushed; the message just waits until they next open the app.
+    final wake = await _identityService
+        .signWakeRequest(peerId: to)
+        .catchError((Object e) {
+          print('Relay: wake signing failed: $e');
+          return null;
+        });
     _send({
       'type': 'store',
       'to': to,
       'from': from,
       'payload': encryptedPayload,
+      if (wake != null) 'wake': wake,
     });
   }
 

@@ -189,7 +189,7 @@ class _ChatScreenState extends State<ChatScreen> {
     if (widget.signaling?.isPeerConnected(widget.contact.id) ?? false) {
       await widget.signaling?.sendMessage(widget.contact.id, payload);
     } else {
-      widget.relayService?.storeMessage(
+      await widget.relayService?.storeMessage(
         widget.contact.id,
         widget.myId ?? 'unknown',
         payload,
