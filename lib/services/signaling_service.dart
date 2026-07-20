@@ -32,6 +32,11 @@ class SignalingService {
   final Map<String, List<RTCIceCandidate>> _pendingIceCandidates = {};
   final Map<String, List<RTCIceCandidate>> _pendingCallIceCandidates = {};
 
+  /// Outgoing ICE candidates held while an outgoing call is still ringing,
+  /// because the server discards anything sent to a peer that is not online
+  /// yet. Flushed when the callee answers.
+  final List<Map<String, dynamic>> _pendingOutboundIce = [];
+
   Function(String peerId, String message)? onMessageReceived;
   Function(bool connected)? onConnectionStateChanged;
   Function(String peerId)? onPeerConnected;
@@ -518,6 +523,7 @@ class SignalingService {
           );
           await _flushPendingCallIceCandidates(callId!, webrtc);
           _activeCall?.markAnswered();
+          _flushPendingOutboundIce();
           _activeCallDeadlineTimer?.cancel();
           _activeCallDeadlineTimer = null;
           onCallAnswered?.call();
@@ -815,6 +821,22 @@ class SignalingService {
           return;
         }
         payload['callId'] = session.callId;
+        // An outgoing call rings before the callee is reachable — on a cold
+        // start they are asleep for seconds while FCM wakes them. The server
+        // drops anything addressed to an offline peer ("Peer not found or
+        // offline"), and ICE gathering finishes long before they answer, so
+        // every candidate we produced was discarded and none were ever
+        // regenerated. The callee ended up with zero candidates from us.
+        //
+        // Hold them until the answer arrives, then flush. Same-network calls
+        // survived this by discovering us peer-reflexively from our inbound
+        // checks; across CGNAT there is no such fallback and the call
+        // connects with no media at all.
+        if (!session.isAnswered &&
+            session.direction == CallSessionDirection.outgoing) {
+          _pendingOutboundIce.add(payload);
+          return;
+        }
       }
       _send(payload);
     });
@@ -837,6 +859,17 @@ class SignalingService {
     if (candidates == null) return;
     for (final candidate in candidates) {
       await webrtc.addIceCandidate(candidate);
+    }
+  }
+
+  /// Sends the candidates we held back while the callee was unreachable.
+  void _flushPendingOutboundIce() {
+    if (_pendingOutboundIce.isEmpty) return;
+    print('[CALL] flushing ${_pendingOutboundIce.length} held ICE candidates');
+    final held = List<Map<String, dynamic>>.from(_pendingOutboundIce);
+    _pendingOutboundIce.clear();
+    for (final payload in held) {
+      _send(payload);
     }
   }
 
@@ -896,6 +929,7 @@ class SignalingService {
       await _closePeer(peerId);
     }
     _pendingCallIceCandidates.clear();
+    _pendingOutboundIce.clear();
     print('[CALL] startVoiceCall peer=$peerId');
     final now = DateTime.now().millisecondsSinceEpoch;
     final callId = '${_myId}_${peerId}_$now';
@@ -1078,6 +1112,7 @@ class SignalingService {
     _activeCall = null;
     session.pendingOffer = null;
     _pendingCallIceCandidates.clear();
+    _pendingOutboundIce.clear();
     // Emit the log record before the UI teardown callback. This is the only
     // place a call is logged, so it runs once per session regardless of which
     // of the many teardown paths got us here.
