@@ -179,6 +179,7 @@ class IncomingCallFastStartController {
     signalingService.onCallEnded = null;
     signalingService.onCallAnswered = null;
     signalingService.onRemoteStream = null;
+    signalingService.onCallCompleted = null;
   }
 
   Future<void> _cancelCallNotification() async {

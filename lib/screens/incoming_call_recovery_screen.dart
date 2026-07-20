@@ -2,6 +2,7 @@ import 'dart:async';
 
 import 'package:flutter/material.dart';
 
+import '../services/call_log_store.dart';
 import '../services/call_notification_service.dart';
 import '../services/incoming_call_fast_start.dart';
 import '../services/ringtone_service.dart';
@@ -29,6 +30,7 @@ class IncomingCallRecoveryScreen extends StatefulWidget {
 class _IncomingCallRecoveryScreenState
     extends State<IncomingCallRecoveryScreen> {
   late final IncomingCallFastStartController _controller;
+  final _callLog = CallLogStore();
   final _callAnsweredNotifier = ValueNotifier<bool>(false);
   final _remoteStreamNotifier = ValueNotifier<dynamic>(null);
   bool _showIncomingCall = false;
@@ -46,6 +48,16 @@ class _IncomingCallRecoveryScreenState
     _controller.state.addListener(_onFastStartState);
     _controller.signalingService.onCallAnswered = () {
       _callAnsweredNotifier.value = true;
+    };
+    // Cold-start calls are torn down here, before ContactsScreen exists, so
+    // without this handler an answered call kept the FCM wake handler's
+    // missed-by-default entry forever.
+    _controller.signalingService.onCallCompleted = (call) {
+      unawaited(
+        _callLog
+            .append(call.toLogEntry(widget.launch.callerName))
+            .catchError((_) {}),
+      );
     };
     _controller.signalingService.onRemoteStream = (stream) {
       _remoteStreamNotifier.value = stream;

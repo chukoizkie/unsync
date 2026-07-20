@@ -33,6 +33,14 @@ class SignalingService {
   Function(String peerId)? onIncomingCall;
   Function()? onCallAnswered;
   Function()? onCallEnded;
+
+  /// Fires exactly once per call, at teardown, with the outcome derived from
+  /// session state. Call-log policy lives here rather than in the screens:
+  /// each screen used to reconstruct the outcome from its own local signals,
+  /// which is why answered, declined, outgoing and cold-start calls were all
+  /// logged wrongly in different ways.
+  Function(CompletedCall call)? onCallCompleted;
+
   Function(String callId)? onCallTimedOut;
   Function(dynamic stream)? onRemoteStream;
 
@@ -454,7 +462,7 @@ class SignalingService {
             RTCSessionDescription(msg['sdp']['sdp'], msg['sdp']['type']),
           );
           await _flushPendingCallIceCandidates(callId!, webrtc);
-          _activeCall?.state = CallSessionState.active;
+          _activeCall?.markAnswered();
           _activeCallDeadlineTimer?.cancel();
           _activeCallDeadlineTimer = null;
           onCallAnswered?.call();
@@ -892,7 +900,11 @@ class SignalingService {
         'callId': session.callId,
       });
       session.pendingOffer = null;
-      session.state = CallSessionState.active;
+      // The callee's answered-state was previously never recorded anywhere:
+      // onCallAnswered only fires on the caller's leg, so every answered
+      // incoming call was logged as missed.
+      session.markAnswered();
+      onCallAnswered?.call();
       _activeCallDeadlineTimer?.cancel();
       _activeCallDeadlineTimer = null;
       return true;
@@ -965,6 +977,12 @@ class SignalingService {
     _activeCall = null;
     session.pendingOffer = null;
     _pendingCallIceCandidates.clear();
+    // Emit the log record before the UI teardown callback. This is the only
+    // place a call is logged, so it runs once per session regardless of which
+    // of the many teardown paths got us here.
+    onCallCompleted?.call(
+      session.toCompletedCall(locallyDeclined: reason == 'decline'),
+    );
     onCallEnded?.call();
 
     _activeCallCleanup = () async {
