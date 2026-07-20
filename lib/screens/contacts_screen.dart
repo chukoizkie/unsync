@@ -351,6 +351,12 @@ class _ContactsScreenState extends State<ContactsScreen>
       // ── notification tap handlers ──────────────────────────────────────────
       MessageNotificationService.onNotificationTapped = (peerId) async {
         if (_openChatPeerId == peerId) return;
+        // Claim synchronously, before any await. Tapping a message
+        // notification for a closed app triggers this twice — once from the
+        // notification launch details and once from the pending_message_wake
+        // flag the FCM handler wrote — and the awaits below let both past the
+        // guard, pushing two chat screens on top of each other.
+        _openChatPeerId = peerId;
         await Future.delayed(const Duration(seconds: 2));
         await _reloadContacts();
         final saved = _realContacts.firstWhere(
@@ -361,7 +367,12 @@ class _ContactsScreenState extends State<ContactsScreen>
             addedAt: DateTime.now(),
           ),
         );
-        if (!mounted) return;
+        if (!mounted) {
+          // Release the claim taken above, or this conversation could never
+          // be opened again and its notifications would stay suppressed.
+          _openChatPeerId = null;
+          return;
+        }
         final contact = Contact(
           id: saved.peerId,
           name: saved.displayName,
@@ -586,6 +597,13 @@ class _ContactsScreenState extends State<ContactsScreen>
         final pendingFromId = prefs.getString('pending_message_wake');
         if (pendingFromId != null && pendingFromId.isNotEmpty) {
           await prefs.remove('pending_message_wake');
+          if (pendingFromId == initialPeerId) {
+            // Same tap, already handled above. Both signals fire for a message
+            // notification opened from a closed app; acting on both opened the
+            // chat twice.
+            await MessageNotificationService.cancelForPeer(pendingFromId);
+            return;
+          }
           // Only this conversation's notification. cancel() is cancelAll(),
           // which would also tear down an incoming-call notification that
           // happened to arrive while we were resuming.
