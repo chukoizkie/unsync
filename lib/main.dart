@@ -76,7 +76,11 @@ void main() async {
 
 Future<void> _initializeFirebaseServices() async {
   await Firebase.initializeApp();
-  FlutterForegroundTask.requestIgnoreBatteryOptimization();
+  // Battery-optimization exemption is NOT requested here. This runs on every
+  // launch, including the incoming-call path, so it threw a system dialog in
+  // front of the call screen and stole focus while the phone was ringing.
+  // ForegroundServiceManager.start() asks instead: once, guarded by
+  // isIgnoringBatteryOptimizations, and only on the normal app path.
   FirebaseMessaging.onBackgroundMessage(firebaseMessagingBackgroundHandler);
 }
 
