@@ -3,6 +3,7 @@ import 'package:flutter/services.dart';
 import 'package:qr_flutter/qr_flutter.dart';
 import 'package:mobile_scanner/mobile_scanner.dart';
 import 'dart:convert';
+import '../services/pairing_window_service.dart';
 import '../theme.dart';
 
 class QRScreen extends StatefulWidget {
@@ -29,10 +30,15 @@ class _QRScreenState extends State<QRScreen> with SingleTickerProviderStateMixin
   void initState() {
     super.initState();
     _tabController = TabController(length: 2, vsync: this);
+    // Showing your code is the consent signal: while this screen is up, an
+    // unknown peer may be introduced to us. Closes (with a grace period) on
+    // dispose.
+    PairingWindowService.open();
   }
 
   @override
   void dispose() {
+    PairingWindowService.close();
     _tabController.dispose();
     super.dispose();
   }

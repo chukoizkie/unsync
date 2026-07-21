@@ -36,6 +36,11 @@ class MessageNotificationService {
     } catch (_) {}
   }
 
+  /// Notification id for a conversation. Keyed on peer id, not display name:
+  /// the name is not stable (a contact can rename, two contacts can share a
+  /// name) and a per-peer id is what makes [cancelForPeer] possible at all.
+  static int _notificationId(String key) => key.hashCode;
+
   static Future<void> showMessageNotification(String senderName, String message, {String? peerId}) async {
     const details = AndroidNotificationDetails(
       _channelId,
@@ -47,7 +52,7 @@ class MessageNotificationService {
       visibility: NotificationVisibility.private,
     );
     await _plugin.show(
-      senderName.hashCode,
+      _notificationId(peerId ?? senderName),
       senderName,
       message,
       const NotificationDetails(android: details),
@@ -55,6 +60,15 @@ class MessageNotificationService {
     );
   }
 
+  /// Dismisses the notification for one conversation, leaving every other
+  /// notification alone — in particular an in-progress incoming call.
+  static Future<void> cancelForPeer(String peerId) async {
+    if (peerId.isEmpty) return;
+    await _plugin.cancel(_notificationId(peerId));
+  }
+
+  /// Clears every notification this app has posted, including call
+  /// notifications. Prefer [cancelForPeer]; this is a blunt instrument.
   static Future<void> cancel() async {
     await _plugin.cancelAll();
   }

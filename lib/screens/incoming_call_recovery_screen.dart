@@ -2,6 +2,7 @@ import 'dart:async';
 
 import 'package:flutter/material.dart';
 
+import '../services/call_log_store.dart';
 import '../services/call_notification_service.dart';
 import '../services/incoming_call_fast_start.dart';
 import '../services/ringtone_service.dart';
@@ -29,12 +30,15 @@ class IncomingCallRecoveryScreen extends StatefulWidget {
 class _IncomingCallRecoveryScreenState
     extends State<IncomingCallRecoveryScreen> {
   late final IncomingCallFastStartController _controller;
+  final _callLog = CallLogStore();
   final _callAnsweredNotifier = ValueNotifier<bool>(false);
   final _remoteStreamNotifier = ValueNotifier<dynamic>(null);
   bool _showIncomingCall = false;
   bool _showActiveCall = false;
   bool _isMuted = false;
+  bool _isSpeakerOn = false;
   bool _leaving = false;
+  bool _handoffStarted = false;
 
   @override
   void initState() {
@@ -45,6 +49,16 @@ class _IncomingCallRecoveryScreenState
     _controller.state.addListener(_onFastStartState);
     _controller.signalingService.onCallAnswered = () {
       _callAnsweredNotifier.value = true;
+    };
+    // Cold-start calls are torn down here, before ContactsScreen exists, so
+    // without this handler an answered call kept the FCM wake handler's
+    // missed-by-default entry forever.
+    _controller.signalingService.onCallCompleted = (call) {
+      unawaited(
+        _callLog
+            .append(call.toLogEntry(widget.launch.callerName))
+            .catchError((_) {}),
+      );
     };
     _controller.signalingService.onRemoteStream = (stream) {
       _remoteStreamNotifier.value = stream;
@@ -68,9 +82,7 @@ class _IncomingCallRecoveryScreenState
     }
     if (phase == IncomingCallFastStartPhase.expired && mounted) {
       unawaited(CallNotificationService.cancel().catchError((_) {}));
-      Navigator.of(context).pushReplacement(
-        MaterialPageRoute<void>(builder: (_) => const ContactsScreen()),
-      );
+      _handoffToContacts();
     }
   }
 
@@ -82,8 +94,22 @@ class _IncomingCallRecoveryScreenState
     _callAnsweredNotifier.value = false;
     _remoteStreamNotifier.value = null;
     if (!mounted) return;
+    _handoffToContacts();
+  }
+
+  void _handoffToContacts() {
+    if (_handoffStarted) return;
+    _handoffStarted = true;
+    _leaving = true;
+    _controller.releaseForHandoff();
+    StartupLatency.mark('recovery_handoff_complete');
     Navigator.of(context).pushAndRemoveUntil(
-      MaterialPageRoute<void>(builder: (_) => const ContactsScreen()),
+      MaterialPageRoute<void>(
+        builder: (_) => ContactsScreen(
+          identity: _controller.identityService,
+          signaling: _controller.signalingService,
+        ),
+      ),
       (route) => false,
     );
   }
@@ -125,6 +151,15 @@ class _IncomingCallRecoveryScreenState
         onMuteTap: () {
           setState(() => _isMuted = !_isMuted);
           _controller.signalingService.setMicMuted(_isMuted);
+        },
+        isSpeakerOn: _isSpeakerOn,
+        onSpeakerTap: () {
+          setState(() => _isSpeakerOn = !_isSpeakerOn);
+          unawaited(
+            _controller.signalingService
+                .setSpeakerphone(_isSpeakerOn)
+                .catchError((_) {}),
+          );
         },
         onHangUp: () => _controller.signalingService.endVoiceCall(),
         callAnsweredNotifier: _callAnsweredNotifier,

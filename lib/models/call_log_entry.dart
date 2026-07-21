@@ -74,6 +74,16 @@ class CallLogEntry {
   /// Stored, used for dedup — NEVER displayed.
   final String callId;
 
+  /// Whether this counts as a missed call: an *incoming* call that was never
+  /// answered. An outgoing call nobody picked up is a no-answer, not a missed
+  /// call, and must not appear under the Missed filter.
+  ///
+  /// Single definition on purpose — the filter and the row styling previously
+  /// each had their own, so a row reading "No answer" still showed up when
+  /// filtering by Missed.
+  bool get isMissedCall =>
+      outcome == CallOutcome.missed && direction == CallDirection.incoming;
+
   Map<String, dynamic> toJson() {
     return {
       'peerId': peerId,

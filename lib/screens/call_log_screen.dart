@@ -72,9 +72,7 @@ class _CallLogScreenState extends State<CallLogScreen> {
       case _Filter.all:
         return _all;
       case _Filter.missed:
-        return _all
-            .where((e) => e.outcome == CallOutcome.missed)
-            .toList(growable: false);
+        return _all.where((e) => e.isMissedCall).toList(growable: false);
       case _Filter.incoming:
         return _all
             .where((e) => e.direction == CallDirection.incoming)
@@ -286,9 +284,11 @@ class _CallLogRow extends StatelessWidget {
 
   static const _missedColor = Color(0xFFFF6B6B);
 
+  bool get _isMissed => entry.isMissedCall;
+
   @override
   Widget build(BuildContext context) {
-    final missed = entry.outcome == CallOutcome.missed;
+    final missed = _isMissed;
     final iconColor = missed ? _missedColor : kAccent;
 
     return Padding(
@@ -331,7 +331,7 @@ class _CallLogRow extends StatelessWidget {
   }
 
   IconData get _directionIcon {
-    if (entry.outcome == CallOutcome.missed) return Icons.call_missed;
+    if (_isMissed) return Icons.call_missed;
     if (entry.direction == CallDirection.outgoing) return Icons.call_made;
     return Icons.call_received;
   }
@@ -350,7 +350,7 @@ class _CallLogRow extends StatelessWidget {
       case CallOutcome.answered:
         return entry.direction == CallDirection.outgoing ? 'Outgoing' : 'Answered';
       case CallOutcome.missed:
-        return 'Missed';
+        return _isMissed ? 'Missed' : 'No answer';
       case CallOutcome.declined:
         return 'Declined';
     }

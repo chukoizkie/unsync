@@ -15,6 +15,12 @@ class SignalingService {
   static const String signalingUrl = UnsyncConfig.signalingUrl;
   static const int _idleTimeoutSeconds = 120;
 
+  /// Hard ring limit. An unanswered call is dropped this long after it starts,
+  /// on both legs, regardless of the longer deadline the server allows
+  /// (PENDING_CALL_TTL_MS, currently 60s). The server deadline still applies
+  /// when it is the shorter of the two, so this only ever tightens.
+  static const Duration maxRingDuration = Duration(seconds: 30);
+
   WebSocketChannel? _channel;
   final IdentityService _identityService;
   final SignalingChannelFactory _channelFactory;
@@ -26,6 +32,11 @@ class SignalingService {
   final Map<String, List<RTCIceCandidate>> _pendingIceCandidates = {};
   final Map<String, List<RTCIceCandidate>> _pendingCallIceCandidates = {};
 
+  /// Outgoing ICE candidates held while an outgoing call is still ringing,
+  /// because the server discards anything sent to a peer that is not online
+  /// yet. Flushed when the callee answers.
+  final List<Map<String, dynamic>> _pendingOutboundIce = [];
+
   Function(String peerId, String message)? onMessageReceived;
   Function(bool connected)? onConnectionStateChanged;
   Function(String peerId)? onPeerConnected;
@@ -33,12 +44,26 @@ class SignalingService {
   Function(String peerId)? onIncomingCall;
   Function()? onCallAnswered;
   Function()? onCallEnded;
+
+  /// Fires exactly once per call, at teardown, with the outcome derived from
+  /// session state. Call-log policy lives here rather than in the screens:
+  /// each screen used to reconstruct the outcome from its own local signals,
+  /// which is why answered, declined, outgoing and cold-start calls were all
+  /// logged wrongly in different ways.
+  Function(CompletedCall call)? onCallCompleted;
+
   Function(String callId)? onCallTimedOut;
   Function(dynamic stream)? onRemoteStream;
 
   String? _myId;
   String? get myId => _myId;
   String? _fcmToken;
+
+  /// The token value carried by the most recent `register` we sent. Compared
+  /// against [_fcmToken] so a token that arrives mid-handshake is flushed once
+  /// the server confirms registration, instead of being stranded until the
+  /// next reconnect. The server only learns tokens via `register`.
+  String? _sentFcmToken;
 
   // DHT identity - set before connecting
   String? _myHandle;
@@ -103,6 +128,16 @@ class SignalingService {
     final connectionGeneration = ++_connectionGeneration;
 
     _authChallengeTimer?.cancel();
+    // Close any socket from a previous connect() on this instance. The
+    // generation bump above already fences its callbacks, but without an
+    // explicit close the old socket stays open and the server sees two live
+    // connections for one peer id. Reachable when ContactsScreen adopts a
+    // handed-off service that had not finished registering.
+    final previousChannel = _channel;
+    _channel = null;
+    if (previousChannel != null) {
+      unawaited(Future.sync(previousChannel.sink.close).catchError((_) {}));
+    }
     _channel = _channelFactory(Uri.parse(signalingUrl));
     unawaited(
       _channel!.ready
@@ -116,7 +151,13 @@ class SignalingService {
     _channel!.stream.listen(
       (data) {
         if (connectionGeneration != _connectionGeneration) return;
-        final msg = jsonDecode(data as String);
+        final Map<String, dynamic> msg;
+        try {
+          msg = jsonDecode(data as String) as Map<String, dynamic>;
+        } catch (e) {
+          print('Signaling dropped unparseable frame: $e');
+          return;
+        }
         _handleMessage(msg, connectionGeneration);
       },
       onError: (e) {
@@ -166,15 +207,41 @@ class SignalingService {
     if (myId == null) return;
     _registerSent = true;
     StartupLatency.mark('register', data: {'fcmToken': _fcmToken != null});
-    _send({'type': 'register', 'id': myId, 'fcmToken': _fcmToken});
+    _sentFcmToken = _fcmToken;
+    _send(_registerPayload(myId));
+  }
+
+  /// The key is omitted when we have no token. Sending an explicit null fails
+  /// the server's `msg.fcmToken !== undefined && !isNonEmptyString(...)` check
+  /// and rejects the whole register — which is why the cold-start recovery
+  /// path, the one connection that has no token yet, never registered and so
+  /// never received its pending call replay.
+  Map<String, dynamic> _registerPayload(String myId) {
+    final payload = <String, dynamic>{'type': 'register', 'id': myId};
+    final token = _fcmToken;
+    if (token != null && token.isNotEmpty) {
+      payload['fcmToken'] = token;
+    }
+    return payload;
   }
 
   void updateFcmToken(String? fcmToken) {
     if (fcmToken == null || fcmToken.isEmpty) return;
     _fcmToken = fcmToken;
+    // Not registered yet: keep the token and let the `registered` handler
+    // flush it. Dropping it here used to strand the token on the client until
+    // some later reconnect happened to race the other way, leaving the peer
+    // unreachable for FCM wake-ups.
+    _flushFcmTokenIfStale();
+  }
+
+  /// Re-sends `register` when the server's view of our token is behind ours.
+  void _flushFcmTokenIfStale() {
     final myId = _myId;
     if (!_registered || myId == null) return;
-    _send({'type': 'register', 'id': myId, 'fcmToken': _fcmToken});
+    if (_fcmToken == null || _fcmToken == _sentFcmToken) return;
+    _sentFcmToken = _fcmToken;
+    _send(_registerPayload(myId));
   }
 
   int _reconnectAttempt = 0;
@@ -197,7 +264,20 @@ class SignalingService {
     });
   }
 
-  void _handleMessage(
+  void _handleMessage(Map<String, dynamic> msg, int connectionGeneration) async {
+    try {
+      await _dispatchMessage(msg, connectionGeneration);
+    } catch (e, stack) {
+      // The dispatcher indexes into server-supplied maps in a dozen places
+      // (msg['sdp']['sdp'], `as String` casts). Without this, one malformed
+      // frame throws inside the WebSocket listener as an unhandled async
+      // error. A bad frame should cost us that frame, not the connection.
+      print('Signaling message failed type=${msg['type']} error=$e');
+      print(stack);
+    }
+  }
+
+  Future<void> _dispatchMessage(
     Map<String, dynamic> msg,
     int connectionGeneration,
   ) async {
@@ -252,6 +332,9 @@ class SignalingService {
         _pingTimer = Timer.periodic(const Duration(seconds: 30), (_) {
           _send({'type': 'ping'});
         });
+        // A token that arrived between `register` and `registered` was held
+        // back; send it now that the server will accept it.
+        _flushFcmTokenIfStale();
         break;
 
       case 'knock':
@@ -336,12 +419,23 @@ class SignalingService {
             break;
           }
           session.createdAt = _dateTimeFromServerMillis(msg['createdAt']);
-          session.expiresAt = _dateTimeFromServerMillis(msg['expiresAt']);
-          if (session.expiresAt == null) {
+          final serverExpiresAt = _dateTimeFromServerMillis(msg['expiresAt']);
+          if (serverExpiresAt == null) {
             _rejectStaleCallEvent('call_offer_accepted', callId);
             await _cleanupActiveCall(reason: 'missing_call_deadline');
             break;
           }
+          // Keep whichever deadline comes first. session.expiresAt is already
+          // the local ring cap set when the call started, and the server's is
+          // longer, so accepting it wholesale would ring past the cap.
+          session.expiresAt = _earlierDeadline(
+            session.expiresAt,
+            serverExpiresAt,
+          );
+          // _armActiveCallDeadline will not re-arm over a live timer, so the
+          // provisional one has to be cleared first.
+          _activeCallDeadlineTimer?.cancel();
+          _activeCallDeadlineTimer = null;
           _armActiveCallDeadline(session);
           break;
         }
@@ -383,13 +477,18 @@ class SignalingService {
           msg['sdp']['type'],
         );
         _pendingCallIceCandidates.removeWhere((id, _) => id != callId);
+        // Stop ringing at the cap even if the server would allow longer. Timed
+        // from the caller's start when the server told us (a cold-start offer
+        // can arrive seconds late, and ringing past the caller's own cap just
+        // means answering into a call they already dropped).
+        final ringCap = (createdAt ?? DateTime.now()).add(maxRingDuration);
         _activeCall = CallSession(
           callId: callId,
           peerId: fromId,
           direction: CallSessionDirection.incoming,
           state: CallSessionState.incomingRinging,
           createdAt: createdAt,
-          expiresAt: expiresAt,
+          expiresAt: _earlierDeadline(expiresAt, ringCap),
           pendingOffer: offer,
         );
         _armActiveCallDeadline(_activeCall!);
@@ -423,7 +522,8 @@ class SignalingService {
             RTCSessionDescription(msg['sdp']['sdp'], msg['sdp']['type']),
           );
           await _flushPendingCallIceCandidates(callId!, webrtc);
-          _activeCall?.state = CallSessionState.active;
+          _activeCall?.markAnswered();
+          _flushPendingOutboundIce();
           _activeCallDeadlineTimer?.cancel();
           _activeCallDeadlineTimer = null;
           onCallAnswered?.call();
@@ -463,6 +563,25 @@ class SignalingService {
             message.toLowerCase().contains('offline');
         final isCallExpired =
             code == 'CALL_EXPIRED' || message.contains('CALL_EXPIRED');
+
+        // An error arriving after register but before `registered` blocked the
+        // registration. Previously this was ignored entirely, leaving the
+        // socket open but unregistered forever: no replay, no retry, no
+        // reconnect — the cold-start recovery screen just span until it timed
+        // out. Drop a token the server refused so the retry omits it, then
+        // reset so the normal backoff reconnect applies.
+        if (_registerSent && !_registered) {
+          if (message.toLowerCase().contains('fcm token')) {
+            print('[CALL] server rejected FCM token; retrying without it');
+            _fcmToken = null;
+            _sentFcmToken = null;
+          }
+          await _resetActiveConnection(
+            reason: 'register_blocked:$message',
+            connectionGeneration: connectionGeneration,
+          );
+          break;
+        }
 
         final session = _activeCall;
         if (session != null) {
@@ -554,6 +673,14 @@ class SignalingService {
     return null;
   }
 
+  /// Earliest of the two deadlines. The server's is authoritative for when it
+  /// will drop the pending call; ours caps how long we are willing to ring.
+  DateTime? _earlierDeadline(DateTime? a, DateTime? b) {
+    if (a == null) return b;
+    if (b == null) return a;
+    return a.isBefore(b) ? a : b;
+  }
+
   bool _isSessionExpired(CallSession session) {
     final expiresAt = session.expiresAt;
     if (expiresAt == null) return false;
@@ -602,6 +729,13 @@ class SignalingService {
       return;
     }
     print('[CALL] call timed out source=$source callId=$callId');
+    // A locally-decided timeout has to be announced. The server holds the
+    // pending call for its own, longer TTL, so without this the peer keeps
+    // ringing — and an offline peer could still be woken by FCM for a call
+    // this device already gave up on.
+    if (source.startsWith('local')) {
+      _send({'type': 'call_end', 'to': session.peerId, 'callId': callId});
+    }
     onCallTimedOut?.call(callId);
     await _cleanupActiveCall(reason: 'call_timeout:$source');
   }
@@ -687,6 +821,22 @@ class SignalingService {
           return;
         }
         payload['callId'] = session.callId;
+        // An outgoing call rings before the callee is reachable — on a cold
+        // start they are asleep for seconds while FCM wakes them. The server
+        // drops anything addressed to an offline peer ("Peer not found or
+        // offline"), and ICE gathering finishes long before they answer, so
+        // every candidate we produced was discarded and none were ever
+        // regenerated. The callee ended up with zero candidates from us.
+        //
+        // Hold them until the answer arrives, then flush. Same-network calls
+        // survived this by discovering us peer-reflexively from our inbound
+        // checks; across CGNAT there is no such fallback and the call
+        // connects with no media at all.
+        if (!session.isAnswered &&
+            session.direction == CallSessionDirection.outgoing) {
+          _pendingOutboundIce.add(payload);
+          return;
+        }
       }
       _send(payload);
     });
@@ -712,6 +862,17 @@ class SignalingService {
     }
   }
 
+  /// Sends the candidates we held back while the callee was unreachable.
+  void _flushPendingOutboundIce() {
+    if (_pendingOutboundIce.isEmpty) return;
+    print('[CALL] flushing ${_pendingOutboundIce.length} held ICE candidates');
+    final held = List<Map<String, dynamic>>.from(_pendingOutboundIce);
+    _pendingOutboundIce.clear();
+    for (final payload in held) {
+      _send(payload);
+    }
+  }
+
   Future<void> _flushPendingCallIceCandidates(
     String callId,
     WebRTCService webrtc,
@@ -734,6 +895,9 @@ class SignalingService {
 
   Future<void> _closePeer(String peerId) async {
     _idleTimers.remove(peerId)?.cancel();
+    // Candidates buffered for a peer that never completed a connection would
+    // otherwise accumulate for the life of the process.
+    _pendingIceCandidates.remove(peerId);
     final peer = _peers.remove(peerId);
     if (peer == null) return;
     await peer.dispose();
@@ -765,6 +929,7 @@ class SignalingService {
       await _closePeer(peerId);
     }
     _pendingCallIceCandidates.clear();
+    _pendingOutboundIce.clear();
     print('[CALL] startVoiceCall peer=$peerId');
     final now = DateTime.now().millisecondsSinceEpoch;
     final callId = '${_myId}_${peerId}_$now';
@@ -774,7 +939,10 @@ class SignalingService {
       peerId: peerId,
       direction: CallSessionDirection.outgoing,
       state: CallSessionState.outgoingPreparing,
+      // Provisional; replaced by the server's deadline on call_offer_accepted.
+      expiresAt: DateTime.now().add(maxRingDuration),
     );
+    _armActiveCallDeadline(_activeCall!);
     _idleTimers[peerId]?.cancel();
     try {
       final webrtc = await _getOrCreatePeer(peerId, sendInitialOffer: false);
@@ -813,7 +981,21 @@ class SignalingService {
     }
   }
 
+  Future<void> setSpeakerphone(bool on) async {
+    final peerId = _activeCall?.peerId;
+    if (peerId == null) return;
+    await _peers[peerId]?.setSpeakerphone(on);
+  }
+
   Future<bool> acceptCall() async {
+    if (!_registered) {
+      // _send is a silent no-op on a dead socket, so without this guard we
+      // would build the answer, drop it, and still report success — leaving
+      // the callee on a live call screen the caller never sees answered.
+      // The session's deadline timer stays armed and will time it out.
+      print('[CALL] acceptCall blocked because signaling is disconnected');
+      return false;
+    }
     final session = _activeCall;
     if (session == null ||
         !session.isIncoming ||
@@ -853,7 +1035,11 @@ class SignalingService {
         'callId': session.callId,
       });
       session.pendingOffer = null;
-      session.state = CallSessionState.active;
+      // The callee's answered-state was previously never recorded anywhere:
+      // onCallAnswered only fires on the caller's leg, so every answered
+      // incoming call was logged as missed.
+      session.markAnswered();
+      onCallAnswered?.call();
       _activeCallDeadlineTimer?.cancel();
       _activeCallDeadlineTimer = null;
       return true;
@@ -926,6 +1112,13 @@ class SignalingService {
     _activeCall = null;
     session.pendingOffer = null;
     _pendingCallIceCandidates.clear();
+    _pendingOutboundIce.clear();
+    // Emit the log record before the UI teardown callback. This is the only
+    // place a call is logged, so it runs once per session regardless of which
+    // of the many teardown paths got us here.
+    onCallCompleted?.call(
+      session.toCompletedCall(locallyDeclined: reason == 'decline'),
+    );
     onCallEnded?.call();
 
     _activeCallCleanup = () async {

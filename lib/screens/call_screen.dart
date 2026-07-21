@@ -8,6 +8,8 @@ class CallScreen extends StatefulWidget {
   final VoidCallback onHangUp;
   final VoidCallback onMuteTap;
   final bool isMuted;
+  final VoidCallback? onSpeakerTap;
+  final bool isSpeakerOn;
   final ValueNotifier<bool>? callAnsweredNotifier;
   final ValueNotifier<dynamic>? remoteStreamNotifier;
 
@@ -18,6 +20,8 @@ class CallScreen extends StatefulWidget {
     required this.onHangUp,
     required this.onMuteTap,
     required this.isMuted,
+    this.onSpeakerTap,
+    this.isSpeakerOn = false,
     this.callAnsweredNotifier,
     this.remoteStreamNotifier,
   });
@@ -29,13 +33,16 @@ class CallScreen extends StatefulWidget {
 class _CallScreenState extends State<CallScreen> {
   int _seconds = 0;
   Timer? _timer;
+  bool _answered = false;
 
   @override
   void initState() {
     super.initState();
-    _timer = Timer.periodic(const Duration(seconds: 1), (_) {
-      if (mounted) setState(() => _seconds++);
-    });
+    // The timer used to start at mount, so an outgoing call counted its ring
+    // time as call duration. Both legs now set callAnsweredNotifier (the
+    // callee's is set by acceptCall), so this can wait for the real answer.
+    _answered = widget.callAnsweredNotifier?.value ?? true;
+    if (_answered) _startTimer();
     widget.callAnsweredNotifier?.addListener(_onCallAnswered);
     widget.remoteStreamNotifier?.addListener(_onRemoteStream);
 
@@ -50,8 +57,18 @@ class _CallScreenState extends State<CallScreen> {
     }
   }
 
+  void _startTimer() {
+    _timer?.cancel();
+    _timer = Timer.periodic(const Duration(seconds: 1), (_) {
+      if (mounted) setState(() => _seconds++);
+    });
+  }
+
   void _onCallAnswered() {
     print('[CALL] active call screen received call-answered event');
+    if (_answered || widget.callAnsweredNotifier?.value != true) return;
+    _startTimer();
+    if (mounted) setState(() => _answered = true);
   }
 
   void _onRemoteStream() {
@@ -72,6 +89,7 @@ class _CallScreenState extends State<CallScreen> {
   }
 
   String get _duration {
+    if (!_answered) return widget.isOutgoing ? 'Ringing...' : 'Connecting...';
     final m = (_seconds ~/ 60).toString().padLeft(2, '0');
     final s = (_seconds % 60).toString().padLeft(2, '0');
     return '$m:$s';
@@ -152,20 +170,30 @@ class _CallScreenState extends State<CallScreen> {
                       ],
                     ),
                   ),
-                  Column(
-                    children: [
-                      Container(
-                        width: 64, height: 64,
-                        decoration: const BoxDecoration(
-                          shape: BoxShape.circle,
-                          color: Color(0xFF1A1A1A),
+                  GestureDetector(
+                    onTap: widget.onSpeakerTap,
+                    child: Column(
+                      children: [
+                        Container(
+                          width: 64, height: 64,
+                          decoration: BoxDecoration(
+                            shape: BoxShape.circle,
+                            color: widget.isSpeakerOn
+                                ? kAccent.withAlpha(40)
+                                : const Color(0xFF1A1A1A),
+                          ),
+                          child: Icon(
+                            widget.isSpeakerOn
+                                ? Icons.volume_up
+                                : Icons.volume_down,
+                            color: widget.isSpeakerOn ? kAccent : kMuted,
+                          ),
                         ),
-                        child: const Icon(Icons.volume_up, color: kMuted),
-                      ),
-                      const SizedBox(height: 8),
-                      const Text('Speaker',
-                        style: TextStyle(color: kMuted, fontSize: 12)),
-                    ],
+                        const SizedBox(height: 8),
+                        Text(widget.isSpeakerOn ? 'Speaker on' : 'Speaker',
+                          style: const TextStyle(color: kMuted, fontSize: 12)),
+                      ],
+                    ),
                   ),
                 ],
               ),

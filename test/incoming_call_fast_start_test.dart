@@ -1,6 +1,7 @@
 import 'package:flutter/material.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:unsync/main.dart';
+import 'package:unsync/screens/contacts_screen.dart';
 import 'package:unsync/screens/incoming_call_recovery_screen.dart';
 import 'package:unsync/screens/splash_screen.dart';
 import 'package:unsync/services/call_notification_service.dart';
@@ -201,6 +202,30 @@ void main() {
     expect(parsed?.callerId, 'caller-1');
     expect(parsed?.callerName, 'Caller One');
   });
+
+  test('handoff release preserves signaling ownership', () async {
+    final events = <String>[];
+    final identity = _FakeIdentityService(events);
+    final signaling = _FakeSignalingService(events);
+    final controller = IncomingCallFastStartController(
+      launch: launch,
+      identityService: identity,
+      signalingService: signaling,
+      startRingtone: () async => events.add('ringtone'),
+      stopRingtone: () async => events.add('stop_ringtone'),
+      showMissedCall: (_) async => events.add('missed_call'),
+      replayTimeout: const Duration(seconds: 30),
+    );
+
+    await controller.start();
+    controller.releaseForHandoff();
+    await controller.dispose();
+
+    final contacts = ContactsScreen(identity: identity, signaling: signaling);
+    expect(contacts.identity, same(identity));
+    expect(contacts.signaling, same(signaling));
+    expect(events, isNot(contains('signaling_dispose')));
+  });
 }
 
 class _FakeIdentityService extends IdentityService {
@@ -226,12 +251,17 @@ class _FakeSignalingService extends SignalingService {
   final List<String> events;
   String? connectedPeerId;
   bool pendingIncomingCall = false;
+  bool connected = false;
 
   @override
   Future<void> connect(String myId, {String? fcmToken, String? handle}) async {
     connectedPeerId = myId;
+    connected = true;
     events.add('signaling_connect');
   }
+
+  @override
+  bool get isConnected => connected;
 
   @override
   bool hasPendingIncomingCallFrom(String peerId) {
@@ -244,5 +274,7 @@ class _FakeSignalingService extends SignalingService {
   }
 
   @override
-  void dispose() {}
+  void dispose() {
+    events.add('signaling_dispose');
+  }
 }

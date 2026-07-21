@@ -12,6 +12,16 @@ import '../models/call_log_entry.dart';
 class CallLogStore {
   static const _key = 'call_log_v1';
 
+  /// Serializes read-modify-write cycles across every instance in this
+  /// isolate. [append] rewrites the whole array, so two concurrent appends
+  /// would otherwise interleave and drop an entry outright — not merely lose
+  /// an outcome update.
+  ///
+  /// This does NOT cover the FCM background isolate, which has its own copy of
+  /// this static. That race stays open, but the two writers are seconds apart
+  /// in practice (call arrival vs. call teardown).
+  static Future<void> _writeQueue = Future<void>.value();
+
   final FlutterSecureStorage _secureStorage;
 
   CallLogStore({FlutterSecureStorage? secureStorage})
@@ -29,7 +39,15 @@ class CallLogStore {
 
   /// Adds [entry], replacing any existing entry with the same `callId`
   /// (last-write-wins) so an updated outcome/duration overwrites cleanly.
-  Future<void> append(CallLogEntry entry) async {
+  Future<void> append(CallLogEntry entry) {
+    final next = _writeQueue.then((_) => _appendLocked(entry));
+    // Keep the chain alive even if this append throws, so one failure cannot
+    // wedge every later write behind a permanently-rejected future.
+    _writeQueue = next.catchError((_) {});
+    return next;
+  }
+
+  Future<void> _appendLocked(CallLogEntry entry) async {
     final entries = await _read();
     entries.removeWhere((existing) => existing.callId == entry.callId);
     entries.add(entry);

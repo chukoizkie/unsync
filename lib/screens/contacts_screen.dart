@@ -18,12 +18,12 @@ import '../services/foreground_service.dart';
 import '../services/fcm_service.dart';
 import '../services/call_notification_service.dart';
 import '../services/message_notification_service.dart';
+import '../services/pairing_window_service.dart';
 import '../services/ringtone_service.dart';
 import '../services/biometric_service.dart';
 import '../services/profile_photo_service.dart';
 import '../services/startup_latency.dart';
 import '../services/call_log_store.dart';
-import '../models/call_log_entry.dart';
 import 'qr_screen.dart';
 import 'call_screen.dart';
 import 'incoming_call_screen.dart';
@@ -31,7 +31,15 @@ import 'chat_screen.dart';
 import 'call_log_screen.dart';
 
 class ContactsScreen extends StatefulWidget {
-  const ContactsScreen({super.key});
+  const ContactsScreen({super.key, this.identity, this.signaling});
+
+  /// Optional pre-initialized identity (from SplashScreen) so boot doesn't
+  /// pay for a second IdentityService.initialize().
+  final IdentityService? identity;
+
+  /// Optional already-connected signaling service from the incoming-call
+  /// recovery path. Ownership transfers to this screen when supplied.
+  final SignalingService? signaling;
 
   @override
   State<ContactsScreen> createState() => _ContactsScreenState();
@@ -40,12 +48,15 @@ class ContactsScreen extends StatefulWidget {
 class _ContactsScreenState extends State<ContactsScreen>
     with WidgetsBindingObserver {
   int _selectedTab = 0;
-  final _signaling = SignalingService();
-  final _identity = IdentityService();
+  late final IdentityService _identity = widget.identity ?? IdentityService();
+  late final SignalingService _signaling =
+      widget.signaling ?? SignalingService(identityService: _identity);
   final _contactsService = ContactsService();
   final _messagesService = MessagesService();
   final _signalService = SignalService();
-  final _relayService = RelayService();
+  late final RelayService _relayService = RelayService(
+    identityService: _identity,
+  );
   final _profilePhotoService = ProfilePhotoService();
 
   bool _connected = false;
@@ -65,21 +76,29 @@ class _ContactsScreenState extends State<ContactsScreen>
   String? _pendingNotificationCallerId;
   AppLifecycleState _lifecycleState = AppLifecycleState.resumed;
   bool _initialCallLaunchChecked = false;
+  Future<void>? _signalInitFuture; // Signal init runs concurrently with connect
 
   // ── call-log wiring ──
+  // Outcome, direction, timing and dedup all live in SignalingService now.
+  // This screen only resolves a display name and persists.
   final _callLog = CallLogStore();
-  String? _logCallId; // callId captured when the current call began
-  DateTime? _logCallStart; // set when answered, for duration
-  String? _loggedCallId; // callId already written, to prevent double-log
-  String? _logPeerId; // peer id captured for the active call
-  String? _logName; // display name captured for the active call
 
   bool get _isAppVisible => _lifecycleState == AppLifecycleState.resumed;
+  bool get _hasReusableIdentity =>
+      widget.identity != null && (_identity.peerId?.isNotEmpty ?? false);
+  bool get _hasReusableSignaling =>
+      widget.signaling != null && widget.signaling!.isConnected;
 
   @override
   void initState() {
     super.initState();
-    StartupLatency.mark('contacts_screen_init');
+    StartupLatency.mark(
+      'contacts_screen_init',
+      data: {
+        'reusedIdentity': _hasReusableIdentity,
+        'reusedSignaling': _hasReusableSignaling,
+      },
+    );
     WidgetsBinding.instance.addObserver(this);
     _lifecycleState =
         WidgetsBinding.instance.lifecycleState ?? AppLifecycleState.resumed;
@@ -171,27 +190,9 @@ class _ContactsScreenState extends State<ContactsScreen>
         onDecline: () async {
           final navigator = Navigator.of(context);
           await RingtoneService.stopRinging();
-          final declinedCallId = _signaling.activeCallId;
+          // declineCall() tears the session down synchronously, which emits
+          // the log record with outcome=declined. No logging needed here.
           _signaling.declineCall();
-          if (declinedCallId != null && declinedCallId != _loggedCallId) {
-            _loggedCallId = declinedCallId;
-            unawaited(
-              _callLog
-                  .append(
-                    CallLogEntry(
-                      peerId: callerId,
-                      name: saved.displayName,
-                      direction: CallDirection.incoming,
-                      outcome: CallOutcome.declined,
-                      type: CallType.audio,
-                      timestamp: DateTime.now(),
-                      callId: declinedCallId,
-                      duration: null,
-                    ),
-                  )
-                  .catchError((_) {}),
-            );
-          }
           try {
             await CallNotificationService.cancel();
           } catch (_) {}
@@ -209,10 +210,6 @@ class _ContactsScreenState extends State<ContactsScreen>
             if (mounted) navigator.pop();
             return;
           }
-          _logCallId = _signaling.activeCallId;
-          _logCallStart = DateTime.now();
-          _logPeerId = callerId;
-          _logName = saved.displayName;
           if (mounted) {
             final route = _createCallRoute(saved.displayName, false);
             navigator
@@ -278,26 +275,9 @@ class _ContactsScreenState extends State<ContactsScreen>
 
         await RingtoneService.stopRinging();
         await CallNotificationService.cancel();
-        final missedCallId = _signaling.activeCallId;
-        if (missedCallId != null && missedCallId != _loggedCallId) {
-          _loggedCallId = missedCallId;
-          unawaited(
-            _callLog
-                .append(
-                  CallLogEntry(
-                    peerId: callerId,
-                    name: _displayNameForPeer(callerId),
-                    direction: CallDirection.incoming,
-                    outcome: CallOutcome.missed,
-                    type: CallType.audio,
-                    timestamp: DateTime.now(),
-                    callId: missedCallId,
-                    duration: null,
-                  ),
-                )
-                .catchError((_) {}),
-          );
-        }
+        // No signaling offer ever arrived, so there is no session to log from.
+        // The FCM background handler already wrote a missed entry under this
+        // call's id when it woke us; leave that as the record.
         await MessageNotificationService.showMessageNotification(
           'Missed call from ${_displayNameForPeer(callerId)}',
           'Tap to open Mercury',
@@ -337,12 +317,19 @@ class _ContactsScreenState extends State<ContactsScreen>
   Future<void> _connect() async {
     try {
       ForegroundServiceManager.init();
-      StartupLatency.mark('identity_load_start');
-      await _identity.initialize();
-      StartupLatency.mark(
-        'identity_load_end',
-        data: {'peerId': _identity.peerId ?? 'missing'},
-      );
+      if (_hasReusableIdentity) {
+        StartupLatency.mark(
+          'identity_load_end',
+          data: {'peerId': _identity.peerId ?? 'missing', 'reused': true},
+        );
+      } else {
+        StartupLatency.mark('identity_load_start');
+        await _identity.initialize();
+        StartupLatency.mark(
+          'identity_load_end',
+          data: {'peerId': _identity.peerId ?? 'missing', 'reused': false},
+        );
+      }
       final id =
           _identity.peerId ?? DateTime.now().millisecondsSinceEpoch.toString();
 
@@ -354,11 +341,22 @@ class _ContactsScreenState extends State<ContactsScreen>
       if (initialCallerId != null) {
         _handleCallNotificationLaunch(initialCallerId);
       }
-      await Future.microtask(() => _signalService.initialize());
+      // Signal init (secure-storage reads + crypto) no longer blocks the
+      // signaling connect; handlers that need it await _signalInitFuture.
+      _signalInitFuture = Future.microtask(() => _signalService.initialize())
+          .catchError((e) {
+            debugPrint('Signal init failed: $e');
+          });
 
       // ── notification tap handlers ──────────────────────────────────────────
       MessageNotificationService.onNotificationTapped = (peerId) async {
         if (_openChatPeerId == peerId) return;
+        // Claim synchronously, before any await. Tapping a message
+        // notification for a closed app triggers this twice — once from the
+        // notification launch details and once from the pending_message_wake
+        // flag the FCM handler wrote — and the awaits below let both past the
+        // guard, pushing two chat screens on top of each other.
+        _openChatPeerId = peerId;
         await Future.delayed(const Duration(seconds: 2));
         await _reloadContacts();
         final saved = _realContacts.firstWhere(
@@ -369,7 +367,12 @@ class _ContactsScreenState extends State<ContactsScreen>
             addedAt: DateTime.now(),
           ),
         );
-        if (!mounted) return;
+        if (!mounted) {
+          // Release the claim taken above, or this conversation could never
+          // be opened again and its notifications would stay suppressed.
+          _openChatPeerId = null;
+          return;
+        }
         final contact = Contact(
           id: saved.peerId,
           name: saved.displayName,
@@ -428,20 +431,16 @@ class _ContactsScreenState extends State<ContactsScreen>
       };
 
       _signaling.onPeerOffline = (peerId) {
-        FCMService.setSignalingConnected(false);
-        _connectionNotifier.value = false;
-        if (mounted) setState(() => _connected = false);
+        // Deliberately does not touch global connection state. `peer_offline`
+        // means one peer is unreachable; our own signaling socket is still up.
+        // Clearing _connected here pinned the UI to "connecting to mesh..."
+        // and, worse, told FCMService we were disconnected — so every later
+        // wake-up was mislabelled. SignalingService has already closed the
+        // peer connection by the time this fires.
+        print('[CALL] peer offline peerId=$peerId (signaling still connected)');
       };
 
       _signaling.onIncomingCall = (peerId) async {
-        final ringingCallId = _signaling.activeCallId;
-        if (ringingCallId != null && ringingCallId != _loggedCallId) {
-          _logCallId = ringingCallId;
-          _logPeerId = peerId;
-          _logName = _displayNameForPeer(peerId);
-          // NOTE: do NOT set _logCallStart here — start time is answer-time only,
-          // used for answered-call duration. A ringing/missed call has no duration.
-        }
         _completePendingNotificationLaunchIfMatches(peerId);
         if (_isAppVisible) {
           _queueIncomingCallRoute(peerId);
@@ -461,57 +460,15 @@ class _ContactsScreenState extends State<ContactsScreen>
         }
       };
 
+      _signaling.onCallCompleted = (call) {
+        unawaited(
+          _callLog
+              .append(call.toLogEntry(_displayNameForPeer(call.peerId)))
+              .catchError((_) {}),
+        );
+      };
+
       _signaling.onCallEnded = () {
-        // Capture answered state BEFORE it is reset below.
-        final wasAnswered = _callAnsweredNotifier.value;
-        if (wasAnswered && _logCallId != null && _logCallId != _loggedCallId) {
-          final endedCallId = _logCallId!;
-          final duration = _logCallStart != null
-              ? DateTime.now().difference(_logCallStart!)
-              : Duration.zero;
-          _loggedCallId = endedCallId;
-          unawaited(
-            _callLog
-                .append(
-                  CallLogEntry(
-                    peerId: _logPeerId ?? endedCallId,
-                    name: _logName ?? (_logPeerId ?? endedCallId),
-                    direction: CallDirection.incoming,
-                    outcome: CallOutcome.answered,
-                    type: CallType.audio,
-                    timestamp: _logCallStart ?? DateTime.now(),
-                    callId: endedCallId,
-                    duration: duration,
-                  ),
-                )
-                .catchError((_) {}),
-          );
-        } else if (!wasAnswered &&
-            _logCallId != null &&
-            _logCallId != _loggedCallId) {
-          final missedCallId = _logCallId!;
-          _loggedCallId = missedCallId;
-          unawaited(
-            _callLog
-                .append(
-                  CallLogEntry(
-                    peerId: _logPeerId ?? missedCallId,
-                    name: _logName ?? (_logPeerId ?? missedCallId),
-                    direction: CallDirection.incoming,
-                    outcome: CallOutcome.missed,
-                    type: CallType.audio,
-                    timestamp: DateTime.now(),
-                    callId: missedCallId,
-                    duration: null,
-                  ),
-                )
-                .catchError((_) {}),
-          );
-        }
-        _logCallId = null;
-        _logCallStart = null;
-        _logPeerId = null;
-        _logName = null;
         _cancelPendingNotificationLaunch();
         unawaited(RingtoneService.stopRinging().catchError((_) {}));
         unawaited(CallNotificationService.cancel().catchError((_) {}));
@@ -537,8 +494,14 @@ class _ContactsScreenState extends State<ContactsScreen>
         _remoteStreamNotifier.value = stream;
       };
 
-      StartupLatency.mark('signaling_connect_start');
-      await _signaling.connect(id, handle: _identity.displayName);
+      if (_hasReusableSignaling) {
+        FCMService.setSignalingConnected(true);
+        _connectionNotifier.value = true;
+        if (mounted) setState(() => _connected = true);
+      } else {
+        StartupLatency.mark('signaling_connect_start');
+        await _signaling.connect(id, handle: _identity.displayName);
+      }
       if (initialCallerId == null) {
         _clearStaleIncomingCallNotificationIfIdle();
       }
@@ -550,6 +513,7 @@ class _ContactsScreenState extends State<ContactsScreen>
 
       Future.delayed(const Duration(seconds: 2), () async {
         try {
+          await _signalInitFuture;
           final bundle = await _signalService.buildPreKeyBundle();
           _relayService.uploadBundle(id, {
             'registrationId': bundle.getRegistrationId(),
@@ -563,11 +527,12 @@ class _ContactsScreenState extends State<ContactsScreen>
             ),
           });
         } catch (e) {
-          print('Bundle upload failed: \$e');
+          print('Bundle upload failed: $e');
         }
       });
 
       _relayService.onQueuedMessage = (from, payload) async {
+        await _signalInitFuture;
         String text = payload;
         if (_signalService.isInitialized) {
           try {
@@ -582,7 +547,7 @@ class _ContactsScreenState extends State<ContactsScreen>
             }
             text = await _signalService.decrypt(from, payload);
           } catch (e) {
-            print('Relay decrypt error: \$e');
+            print('Relay decrypt error: $e');
           }
         }
         await _messagesService.addMessage(from, text, false);
@@ -602,11 +567,14 @@ class _ContactsScreenState extends State<ContactsScreen>
               ),
             )
             .displayName;
-        MessageNotificationService.showMessageNotification(
-          senderName,
-          text,
-          peerId: from,
-        );
+        // Don't notify for the conversation already on screen.
+        if (_openChatPeerId != from) {
+          MessageNotificationService.showMessageNotification(
+            senderName,
+            text,
+            peerId: from,
+          );
+        }
       };
 
       // ── killed-state notification resume ───────────────────────────────────
@@ -629,7 +597,17 @@ class _ContactsScreenState extends State<ContactsScreen>
         final pendingFromId = prefs.getString('pending_message_wake');
         if (pendingFromId != null && pendingFromId.isNotEmpty) {
           await prefs.remove('pending_message_wake');
-          await MessageNotificationService.cancel();
+          if (pendingFromId == initialPeerId) {
+            // Same tap, already handled above. Both signals fire for a message
+            // notification opened from a closed app; acting on both opened the
+            // chat twice.
+            await MessageNotificationService.cancelForPeer(pendingFromId);
+            return;
+          }
+          // Only this conversation's notification. cancel() is cancelAll(),
+          // which would also tear down an incoming-call notification that
+          // happened to arrive while we were resuming.
+          await MessageNotificationService.cancelForPeer(pendingFromId);
           for (int i = 0; i < 30; i++) {
             await Future.delayed(const Duration(milliseconds: 500));
             if (_signaling.myId != null && _realContacts.isNotEmpty) break;
@@ -644,6 +622,7 @@ class _ContactsScreenState extends State<ContactsScreen>
 
       // ── message handling ───────────────────────────────────────────────────
       _signaling.onMessageReceived = (peerId, msg) async {
+        await _signalInitFuture;
         try {
           final parsed = jsonDecode(msg);
           if (parsed['type'] == 'handshake') {
@@ -690,7 +669,7 @@ class _ContactsScreenState extends State<ContactsScreen>
                 );
                 await _signalService.processPreKeyBundle(hid, bundle);
               } catch (e) {
-                print('Signal bundle error: \$e');
+                print('Signal bundle error: $e');
               }
             }
             return;
@@ -702,7 +681,7 @@ class _ContactsScreenState extends State<ContactsScreen>
           try {
             plaintext = await _signalService.decrypt(peerId, msg);
           } catch (e) {
-            print('Decrypt error: \$e');
+            print('Decrypt error: $e');
           }
         }
         _messagesService.addMessage(peerId, plaintext, false).then((_) {
@@ -724,11 +703,14 @@ class _ContactsScreenState extends State<ContactsScreen>
                     ),
                   )
                   .displayName;
-              MessageNotificationService.showMessageNotification(
-                senderName,
-                plaintext,
-                peerId: peerId,
-              );
+              // Don't notify for the conversation already on screen.
+              if (_openChatPeerId != peerId) {
+                MessageNotificationService.showMessageNotification(
+                  senderName,
+                  plaintext,
+                  peerId: peerId,
+                );
+              }
             });
           }
         });
@@ -736,6 +718,26 @@ class _ContactsScreenState extends State<ContactsScreen>
 
       _signaling.onPeerConnected = (peerId) async {
         _connectionNotifier.value = true;
+        // The handshake below carries display name, Signal prekey bundle and
+        // profile photo. SignalingService answers any inbound offer, so this
+        // fires for peers we have never heard of — knowing our peer id was
+        // enough to harvest all three. Introduce ourselves only to saved
+        // contacts, or to anyone while the user is actively pairing.
+        final isSavedContact = _realContacts.any((c) => c.peerId == peerId);
+        if (!PairingWindowService.mayIntroduceTo(
+          isSavedContact: isSavedContact,
+        )) {
+          debugPrint(
+            'Handshake withheld: unknown peer outside the pairing window',
+          );
+          return;
+        }
+        await _signalInitFuture;
+        if (!_signalService.isInitialized) {
+          // Matches pre-change behavior: if Signal init failed, no handshake.
+          debugPrint('Handshake skipped: Signal service not initialized');
+          return;
+        }
         final myName = _identity.displayName ?? 'Unknown';
         final myId2 = _identity.peerId ?? '';
         final bundle = await _signalService.buildPreKeyBundle();
@@ -773,7 +775,7 @@ class _ContactsScreenState extends State<ContactsScreen>
         }
       });
     } catch (e, stack) {
-      print('Connect error: \$e');
+      print('Connect error: $e');
       print(stack);
     }
   }
@@ -782,6 +784,7 @@ class _ContactsScreenState extends State<ContactsScreen>
 
   Widget _buildCallScreen(String contactName, bool isOutgoing) {
     bool isMuted = false;
+    bool isSpeakerOn = false;
     return StatefulBuilder(
       builder: (ctx, setS) => CallScreen(
         contactName: contactName,
@@ -790,6 +793,11 @@ class _ContactsScreenState extends State<ContactsScreen>
         onMuteTap: () {
           setS(() => isMuted = !isMuted);
           _signaling.setMicMuted(isMuted);
+        },
+        isSpeakerOn: isSpeakerOn,
+        onSpeakerTap: () {
+          setS(() => isSpeakerOn = !isSpeakerOn);
+          unawaited(_signaling.setSpeakerphone(isSpeakerOn).catchError((_) {}));
         },
         onHangUp: () => _signaling.endVoiceCall(),
         callAnsweredNotifier: _callAnsweredNotifier,
@@ -1322,7 +1330,7 @@ class _ContactTile extends StatelessWidget {
                     ),
                     child: Center(
                       child: Text(
-                        '\${contact.unread}',
+                        '${contact.unread}',
                         style: const TextStyle(
                           color: kBg,
                           fontSize: 11,

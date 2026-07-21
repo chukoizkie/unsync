@@ -1,6 +1,7 @@
 // ignore_for_file: avoid_print
 
 import 'dart:convert';
+import 'dart:math';
 import 'dart:typed_data';
 
 import 'package:ed25519_edwards/ed25519_edwards.dart' as ed25519;
@@ -123,6 +124,79 @@ class IdentityService {
       serverTime: serverTime,
       debugLogPrefix: _signalingAuthDebug ? '[signaling-auth]' : null,
     );
+  }
+
+  /// Signs a wake request for [peerId] so the relay can ask signaling to push
+  /// an FCM message_wake on our behalf.
+  ///
+  /// Signaling verifies the signature against the *sender's* registered
+  /// identity, so the relay cannot mint these itself — it only forwards what
+  /// we sign here. Returns null when no identity is available.
+  Future<Map<String, dynamic>?> signWakeRequest({
+    required String peerId,
+    DateTime? now,
+    String? requestId,
+  }) async {
+    final identity = await _loadMeshIdentity();
+    if (identity == null) return null;
+
+    final normalizedFrom = normalizeSignalingIdentityId(identity.peerId);
+    final normalizedPeer = normalizeSignalingIdentityId(peerId);
+    if (normalizedFrom.isEmpty || normalizedPeer.isEmpty) return null;
+
+    final timestamp = (now ?? DateTime.now()).millisecondsSinceEpoch;
+    final id = requestId ?? _wakeRequestId();
+    final payload = wakeSigningString(
+      fromId: normalizedFrom,
+      peerId: normalizedPeer,
+      timestamp: timestamp,
+      requestId: id,
+    );
+    final signature = ed25519.sign(
+      _ed25519PrivateKey(identity.privateKey),
+      Uint8List.fromList(utf8.encode(payload)),
+    );
+
+    return <String, dynamic>{
+      'peerId': normalizedPeer,
+      'fromId': normalizedFrom,
+      'timestamp': timestamp,
+      'requestId': id,
+      'pubkey': _relayPublicKey(identity.publicKey),
+      'signature': _base64UrlNoPadding(signature),
+    };
+  }
+
+  /// Mirrors the server's `wakeAuthPayload`: a JSON array, not a delimited
+  /// string like the auth challenges use. Field order is part of the contract.
+  static String wakeSigningString({
+    required String fromId,
+    required String peerId,
+    required int timestamp,
+    required String requestId,
+  }) {
+    return jsonEncode([
+      'cloaknet-wake-v1',
+      'message_wake',
+      fromId,
+      peerId,
+      timestamp,
+      requestId,
+    ]);
+  }
+
+  /// Matches the server's normalizeSignalingIdentityId: the canonical payload
+  /// is built from the binding's identity id, so ours has to agree.
+  static String normalizeSignalingIdentityId(String? peerId) {
+    return (peerId ?? '').trim().replaceAll(RegExp(r'^@+'), '').toLowerCase();
+  }
+
+  /// Server requires 8-128 chars of [A-Za-z0-9._:-]; it also dedupes on this
+  /// value to reject replays, so it must be unique per request.
+  static String _wakeRequestId() {
+    final random = Random.secure();
+    final bytes = List<int>.generate(18, (_) => random.nextInt(256));
+    return _base64UrlNoPadding(bytes);
   }
 
   static String relayAuthSigningString({

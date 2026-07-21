@@ -64,10 +64,14 @@ void main() async {
     return;
   }
 
-  await _initializeFirebaseServices();
   StartupLatency.firstFlutterFrame();
   StartupLatency.mark('runApp', data: {'mode': 'normal'});
   runApp(const MercuryApp());
+  // Firebase is not needed for first paint; initialize it after the first
+  // frame, matching the incoming-call launch paths above.
+  WidgetsBinding.instance.addPostFrameCallback((_) {
+    unawaited(_initializeFirebaseServices());
+  });
 }
 
 Future<void> _initializeFirebaseServices() async {

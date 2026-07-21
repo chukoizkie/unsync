@@ -92,6 +92,9 @@ class FCMService {
     void Function(String token)? onToken,
   }) async {
     _onToken = onToken;
+    // main.dart defers Firebase init to post-frame; ensure it's ready before
+    // touching FirebaseMessaging (no-op if already initialized).
+    await Firebase.initializeApp();
     await _fcm.requestPermission(alert: true, badge: false, sound: true);
     if (!_listenersInitialized) {
       _listenersInitialized = true;
